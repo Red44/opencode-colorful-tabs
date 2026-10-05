@@ -457,10 +457,9 @@ export default Plugin.define({
     // ---- application ----
     const sideBorder = (horizontal: boolean): string[] => {
       if (horizontal) return ["bottom"]
-      // right side is buffer-overpainted in the renderer post-process pass
-      // so overflowing titles cannot push it off the row; only the left
-      // side uses the native border
-      return options.dashLeft ? ["left"] : []
+      // Vertical side bars are both painted in the renderer post-process pass.
+      // Avoid mutating tab boxes so disabling the plugin cannot strand a bar.
+      return []
     }
 
     /**
@@ -479,7 +478,7 @@ export default Plugin.define({
       } catch {}
     }
 
-    // ---- right-edge bindings: row -> owning session ----
+    // ---- vertical tab edge bindings: row -> owning session ----
     const rowBindings = new Map<object, { sessionID: string }>()
     const promptEdgeBindings = new Map<object, string>()
     const promptLabelBindings = new Map<object, string>()
@@ -494,7 +493,7 @@ export default Plugin.define({
 
     /** sync bindings with this frame's matches; true when something changed */
     function updateBindings(matches: Map<AnyObj, Candidate>): boolean {
-      if (!options.dashRight || !postProcessAvailable) return false
+      if ((!options.dashLeft && !options.dashRight) || !postProcessAvailable) return false
       let changed = false
       const seen = new Set<object>()
       for (const cand of [...matches.values()]) {
@@ -523,8 +522,8 @@ export default Plugin.define({
       return changed
     }
 
-    /** paint every bound row's right ┃ from its current post-layout geometry */
-    function paintRightEdges(buffer: any): void {
+    /** paint bound tab rows' enabled side bars from current post-layout geometry */
+    function paintTabEdges(buffer: any): void {
       try {
         for (const [row, binding] of rowBindings) {
           try {
@@ -536,9 +535,12 @@ export default Plugin.define({
             const x0 = typeof r.screenX === "number" ? r.screenX : 0
             const w = typeof r.width === "number" ? r.width : 42
             const hex = rgbToHex(colorFor(binding.sessionID))
-            const x = x0 + w - 1
+            const right = x0 + w - 1
             const rows = Math.min(h, 3)
-            for (let i = 0; i < rows; i++) paintCell(buffer, x, y0 + i, hex)
+            for (let i = 0; i < rows; i++) {
+              if (options.dashLeft) paintCell(buffer, x0, y0 + i, hex)
+              if (options.dashRight && right > x0) paintCell(buffer, right, y0 + i, hex)
+            }
           } catch {}
         }
       } catch {}
@@ -589,7 +591,7 @@ export default Plugin.define({
         rendererAny.buffer ??
         rendererAny.rootBuffer
       if (buf) {
-        paintRightEdges(buf)
+        paintTabEdges(buf)
         paintPromptEdges(buf)
         paintPromptLabels(buf)
       }
