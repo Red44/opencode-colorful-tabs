@@ -11,9 +11,11 @@
  *      OKLCH hue rotations with deterministic per-session jitter and a
  *      lightness wave so neighbors are never similar). After 10, rotate.
  *      Assignments persist per session ID (durable storage).
- *   2. Tab rows get a colored side line (left+right ┃ via the themed box
- *      border) and their title text recolored to the same value. When the
- *      tab strip is horizontal, the color becomes an underline instead
+ *   2. Tab rows get a colored left line (native themed box border), a
+ *      colored right ┃ over-painted in the renderer's post-process pass
+ *      (after all draw commands, so overflowing titles cannot push it off
+ *      the row), and their title text recolored to the same value. When
+ *      the tab strip is horizontal, the color becomes an underline instead
  *      (bottom border).
  *   3. The main prompt window mirrors the ACTIVE tab: its left+right side
  *      dash and the agent name in the prompt footer ("Orchestrator …")
@@ -139,6 +141,8 @@ interface Candidate {
   y: number
   x: number
   horizontal: boolean
+  /** filled in by matchTabs so bindings can be built from matches.values() */
+  sessionID?: string
 }
 
 export default Plugin.define({
@@ -343,7 +347,10 @@ export default Plugin.define({
         return normTabs.some((nt) => nt && (nt.startsWith(nc.slice(0, 10)) || nc.startsWith(nt.slice(0, 10))))
       })
       if (usable.length === tabs.length) {
-        tabs.forEach((t, i) => map.set(t, usable[i]))
+        tabs.forEach((t, i) => {
+          usable[i].sessionID = String(t.sessionID)
+          map.set(t, usable[i])
+        })
         return map
       }
       for (const c of usable) {
@@ -353,7 +360,10 @@ export default Plugin.define({
           const nt = normTabs[i]
           return nt && (nt.startsWith(nc.slice(0, 10)) || nc.startsWith(nt.slice(0, 10)))
         })
-        if (hit) map.set(hit, c)
+        if (hit) {
+          c.sessionID = String(hit.sessionID)
+          map.set(hit, c)
+        }
       }
       return map
     }
@@ -361,49 +371,102 @@ export default Plugin.define({
     // ---- application ----
     const sideBorder = (horizontal: boolean): string[] => {
       if (horizontal) return ["bottom"]
-      // right side is buffer-overpainted (renderAfter) so overflowing titles
-      // cannot push it off the row; only the left side uses the native border
+      // right side is buffer-overpainted in the renderer post-process pass
+      // so overflowing titles cannot push it off the row; only the left
+      // side uses the native border
       return options.dashLeft ? ["left"] : []
     }
 
-    /** over-render the right ┃ after the row's content has drawn */
-    let paintStringOk = true
+    /**
+     * Over-render the right ┃ in the post-process pass: runs after
+     * root.render() and all descendant draw commands, before native output,
+     * so title text can no longer overwrite the bar. drawText requires an
+     * RGBA color, so convert via RGBA.fromHex() directly.
+     */
     function paintCell(buffer: any, x: number, y: number, hex: string): void {
       const bw = typeof buffer?.width === "number" ? buffer.width : Number.POSITIVE_INFINITY
       const bh = typeof buffer?.height === "number" ? buffer.height : Number.POSITIVE_INFINITY
       if (x < 0 || y < 0 || x >= bw || y >= bh) return
+      if (!RGBACls || typeof RGBACls.fromHex !== "function") return
       try {
-        if (paintStringOk) {
-          try {
-            buffer.drawText("┃", x, y, hex)
-            return
-          } catch {
-            paintStringOk = false
-          }
-        }
-        buffer.drawText("┃", x, y, asColor(hex))
+        buffer.drawText("┃", x, y, RGBACls.fromHex(hex))
       } catch {}
     }
 
-    const rowHook = new WeakMap<object, string>()
-    function hookRow(row: any, sessionID: string): void {
-      if (!row || rowHook.get(row) === sessionID) return
+    // ---- right-edge bindings: row -> owning session ----
+    const rowBindings = new Map<object, { sessionID: string }>()
+    const rendererAny = context.renderer as AnyObj
+    const postProcessAvailable =
+      typeof rendererAny.addPostProcessFn === "function" &&
+      typeof rendererAny.removePostProcessFn === "function"
+
+    const isBindable = (row: any): boolean => {
       try {
-        Object.defineProperty(row, "renderAfter", {
-          value: (buffer: any): void => {
-            try {
-              const hex = rgbToHex(colorFor(sessionID))
-              const y0 = row.screenY ?? 0
-              const h = Math.min(row.height ?? 1, 3)
-              const x = (row.screenX ?? 0) + (typeof row.width === "number" ? row.width : 42) - 1
-              for (let i = 0; i < h; i++) paintCell(buffer, x, y0 + i, hex)
-            } catch {}
-          },
-          configurable: true,
-          writable: true,
-        })
-        rowHook.set(row, sessionID)
+        if (!row || row.destroyed === true || row.visible === false) return false
+        if (!row.parent) return false // detached from the tree
+      } catch {
+        return false
+      }
+      return true
+    }
+
+    /** sync bindings with this frame's matches; true when something changed */
+    function updateBindings(matches: Map<AnyObj, Candidate>): boolean {
+      if (!options.dashRight || !postProcessAvailable) return false
+      let changed = false
+      const seen = new Set<object>()
+      for (const cand of [...matches.values()]) {
+        if (cand.horizontal || !cand.sessionID) continue
+        if (!isBindable(cand.row)) continue
+        const row = cand.row as object
+        seen.add(row)
+        const prev = rowBindings.get(row)
+        if (!prev) {
+          rowBindings.set(row, { sessionID: cand.sessionID })
+          changed = true
+        } else if (prev.sessionID !== cand.sessionID) {
+          prev.sessionID = cand.sessionID
+          changed = true
+        }
+      }
+      // drop stale rows: no longer matched, destroyed, hidden or detached
+      for (const row of [...rowBindings.keys()]) {
+        let dead = !seen.has(row)
+        if (!dead) dead = !isBindable(row)
+        if (dead) {
+          rowBindings.delete(row)
+          changed = true
+        }
+      }
+      return changed
+    }
+
+    /** paint every bound row's right ┃ from its current post-layout geometry */
+    function paintRightEdges(buffer: any): void {
+      try {
+        for (const [row, binding] of rowBindings) {
+          try {
+            const r = row as AnyObj
+            const y0 = r.screenY
+            const h = r.height
+            if (typeof y0 !== "number" || typeof h !== "number" || h < 1) continue
+            const x0 = typeof r.screenX === "number" ? r.screenX : 0
+            const w = typeof r.width === "number" ? r.width : 42
+            const hex = rgbToHex(colorFor(binding.sessionID))
+            const x = x0 + w - 1
+            const rows = Math.min(h, 3)
+            for (let i = 0; i < rows; i++) paintCell(buffer, x, y0 + i, hex)
+          } catch {}
+        }
       } catch {}
+    }
+
+    const postProcessFn = (buffer?: any): void => {
+      const buf =
+        buffer ??
+        rendererAny.buffer ??
+        rendererAny.rootBuffer
+      if (buf) paintRightEdges(buf)
     }
 
     function setBoxColor(box: any, hex: string, sides: string[]): boolean {
@@ -435,15 +498,11 @@ export default Plugin.define({
     function applyRow(row: any, tab: AnyObj, horizontal: boolean, rgb: Rgb): boolean {
       let changed = false
       const hex = rgbToHex(rgb)
-      const sessionID = String(tab.sessionID)
-      void sessionID
 
       const sides = sideBorder(horizontal)
       if (sides.length > 0 && row) {
         if (setBoxColor(row, hex, sides)) changed = true
       }
-      // right bar: over-render after content, immune to overflowing titles
-      if (options.dashRight && !horizontal && row) hookRow(row, sessionID)
 
       if (options.recolorTitle) {
         try {
@@ -528,7 +587,6 @@ export default Plugin.define({
         const matches = matchTabs(candidates, tabs as unknown as AnyObj[])
         debug(options.debug, "promptBoxes", promptBoxes.length, "footer", footerTextNodes.slice(0, 8).map((f) => f.text.slice(0, 14)))
         debug(options.debug, "tabs", tabs.length, "matches", matches.size, "active", tabs.find((t: any) => t.active)?.title?.slice?.(0, 18))
-        debug(options.debug, "promptBoxes", promptBoxes.length, "footer", footerTextNodes.slice(0, 6).map((f) => f.text.slice(0, 16)))
         let activeHex: string | null = null
         for (const [tab, cand] of matches) {
           if (applyRow(cand.row, tab, cand.horizontal, colorFor(String(tab.sessionID)))) dirty = true
@@ -536,19 +594,11 @@ export default Plugin.define({
         }
         if (syncPrompt(promptBoxes, footerTextNodes, activeHex)) dirty = true
 
-        // renderAfter only fires when a row renders; static rows never do on
-        // their own. requestRender outside the current pass (frame events can
-        // fire mid-pass, where a direct request would be dropped).
-        if (options.dashRight) {
-          const rows = matches.map(([, cand]) => cand.row)
-          process.nextTick(() => {
-            for (const row of rows) {
-              try {
-                if (rowHook.has(row)) row.requestRender()
-              } catch {}
-            }
-          })
-        }
+        // Right-edge bars paint in the post-process pass from current layout
+        // geometry; no per-frame render requests. Ask for a render only when
+        // styling changed or new/changed bindings appeared (new rows need one
+        // frame before their bar is painted into the buffer).
+        if (updateBindings(matches)) dirty = true
 
         if (dirty) {
           process.nextTick(() => {
@@ -560,11 +610,24 @@ export default Plugin.define({
       } catch {}
     }
 
+    // postProcessFns run after root.render() and every descendant draw
+    // command, before native output — the only point where the right ┃
+    // survives overflowing title text. Register/remove the same reference.
+    if (postProcessAvailable) {
+      try {
+        rendererAny.addPostProcessFn(postProcessFn)
+      } catch {}
+    }
+
     context.renderer.on("frame", onFrame)
     return () => {
       try {
         context.renderer.off("frame", onFrame)
       } catch {}
+      try {
+        if (postProcessAvailable) rendererAny.removePostProcessFn(postProcessFn)
+      } catch {}
+      rowBindings.clear()
     }
   },
 })
