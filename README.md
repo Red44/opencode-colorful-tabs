@@ -4,8 +4,9 @@ Per-tab identity colors for the OpenCode v2 TUI session tab strip, synced
 with the main prompt window.
 
 The TUI plugin API cannot restyle the built-in tab strip, so this plugin
-hooks the renderer's frame event, locates the tab strip renderables in the
-OpenTUI tree, and overrides their themed borders and text colors.
+locates the tab strip renderables in the OpenTUI tree, overrides their themed
+borders and text colors, and post-processes the final frame to keep right-edge
+bars visible even when long titles reach the edge.
 
 ## What it does
 
@@ -17,7 +18,7 @@ OpenTUI tree, and overrides their themed borders and text colors.
   session (survive reordering and restarts) and persist across TUI
   instances.
 - **Vertical tab strip** (`tabs.layout: vertical`) — each tab row gets a
-  colored `│` line on its left and right edges, and the title text is
+  colored heavy `┃` line on its left and right edges, and the title text is
   recolored to the same value.
 - **Horizontal tab strip** (`tabs.layout: horizontal`) — each tab gets a
   colored underline instead.
@@ -27,6 +28,13 @@ OpenTUI tree, and overrides their themed borders and text colors.
   color of the prompt tells you which tab you are in without reading the
   tab strip.
 - Status indicators (busy/error dots) keep their own colors.
+
+## Toggle
+
+Colored tabs are enabled by default. Open the command palette (`Ctrl+P`) and
+run **Toggle Colored Tabs**, or use the `/colored-tabs` slash command, to turn
+the effect on or off. The choice is persisted across TUI restarts. Turning it
+off restores the original tab, prompt, and agent-name colors.
 
 ## Install
 
@@ -45,6 +53,7 @@ change defaults:
     {
       "package": "./plugins/colored-tabs",
       "options": {
+        "enabled": true,       // default state on first run
         "accentStep": "500",   // accent scale step anchoring the palette
         "dashLeft": true,      // left line on vertical tab rows
         "dashRight": true,     // right line on vertical tab rows

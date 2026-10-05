@@ -29,6 +29,8 @@ import { buildPalette, jitterFor, rgbToHex, hexToRgb, type Rgb } from "./colors"
 type AnyObj = Record<string, any>
 
 const OPTIONS_DEFAULTS = {
+  /** master switch for all coloring (persisted; toggled via /colored-tabs) */
+  enabled: true,
   /** accent scale step used to anchor the palette */
   accentStep: "500",
   /** colored line on the left edge of vertical tab rows */
@@ -151,6 +153,12 @@ export default Plugin.define({
     const options = { ...OPTIONS_DEFAULTS, ...(context.options ?? {}) }
     await loadRgbClass()
     if (!context.ui.tabs.enabled()) return
+
+    // ---- master switch (persisted; toggled via /colored-tabs) ----
+    const [settings, updateSettings] = context.storage.store("settings-v1", {
+      initial: { enabled: options.enabled !== false },
+    })
+    const isEnabled = (): boolean => settings.enabled !== false
 
     // ---- session -> palette index assignment (durable, rotates at 10) ----
     const [assign, updateAssign] = context.storage.store("assign-v2", {
@@ -462,6 +470,7 @@ export default Plugin.define({
     }
 
     const postProcessFn = (buffer?: any): void => {
+      if (!isEnabled()) return
       const buf =
         buffer ??
         rendererAny.buffer ??
@@ -469,9 +478,65 @@ export default Plugin.define({
       if (buf) paintRightEdges(buf)
     }
 
+    // ---- pre-mutation snapshots: exact restore when the toggle turns off ----
+    interface BoxSnapshot {
+      border: unknown
+      borderStyle: unknown
+      borderColor: unknown
+      focusedBorderColor: unknown
+    }
+    const boxSnapshots = new Map<object, BoxSnapshot>()
+    const fgSnapshots = new Map<object, unknown>()
+
+    /** capture a box's current styling once, before the plugin first mutates it */
+    function snapshotBox(box: any): void {
+      try {
+        if (boxSnapshots.has(box)) return
+        boxSnapshots.set(box, {
+          border: box.border,
+          borderStyle: box.borderStyle,
+          borderColor: box.borderColor,
+          focusedBorderColor: box.focusedBorderColor,
+        })
+      } catch {}
+    }
+
+    /** capture a text node/chunk's current fg once, before the first recolor */
+    function snapshotFg(node: any): void {
+      try {
+        if (fgSnapshots.has(node)) return
+        fgSnapshots.set(node, node.fg)
+      } catch {}
+    }
+
+    /** put every touched box and text node/chunk back to its pre-plugin state */
+    function restoreOriginalState(): void {
+      try {
+        for (const [box, snap] of boxSnapshots) {
+          box.border = snap.border
+          box.borderStyle = snap.borderStyle
+          box.borderColor = snap.borderColor
+          box.focusedBorderColor = snap.focusedBorderColor
+        }
+        for (const [node, fg] of fgSnapshots) {
+          node.fg = fg
+        }
+      } catch {}
+      boxSnapshots.clear()
+      fgSnapshots.clear()
+      // right-edge bars must not repaint on the next post-process pass
+      rowBindings.clear()
+      process.nextTick(() => {
+        try {
+          context.renderer.requestRender()
+        } catch {}
+      })
+    }
+
     function setBoxColor(box: any, hex: string, sides: string[]): boolean {
       let changed = false
       try {
+        snapshotBox(box)
         if (Array.isArray(box.border) && box.border.join(",") === sides.join(",")) {
           // sides already correct
         } else {
@@ -510,12 +575,16 @@ export default Plugin.define({
           if (titleNorm) {
             for (const tn of findTitleNodes(row, titleNorm)) {
               if (toHex(tn.fg) !== hex) {
+                snapshotFg(tn)
                 tn.fg = asColor(hex)
                 changed = true
               }
               if (Array.isArray(tn.chunks)) {
                 for (const c of tn.chunks) {
-                  if (c && typeof c === "object" && toHex(c.fg) !== hex) c.fg = asColor(hex)
+                  if (c && typeof c === "object" && toHex(c.fg) !== hex) {
+                    snapshotFg(c)
+                    c.fg = asColor(hex)
+                  }
                 }
               }
             }
@@ -560,6 +629,7 @@ export default Plugin.define({
             for (const child of styledChildren(node)) {
               if (!names.has(normalize(child.text))) continue
               if (toHex(child.node.fg) !== activeHex) {
+                snapshotFg(child.node)
                 child.node.fg = asColor(activeHex)
                 changed = true
               }
@@ -578,6 +648,11 @@ export default Plugin.define({
       lastRun = now
       let dirty = false
       try {
+        if (!isEnabled()) {
+          // next frame after a disable: undo every mutation exactly once
+          if (boxSnapshots.size > 0 || fgSnapshots.size > 0) restoreOriginalState()
+          return
+        }
         ensurePalette()
         const tabs = context.ui.tabs.list()
         if (!tabs || tabs.length === 0) return
@@ -619,6 +694,42 @@ export default Plugin.define({
       } catch {}
     }
 
+    // ---- palette/slash toggle: works while disabled (frame hook stays live) ----
+    const toggleEnabled = async (): Promise<void> => {
+      const next = !isEnabled()
+      updateSettings((draft) => {
+        draft.enabled = next
+      }).catch(() => {})
+      settings.enabled = next // immediate local effect, mirrors the assign pattern
+      lastRun = 0 // the very next frame must not be throttled
+      try {
+        context.renderer.requestRender()
+      } catch {}
+    }
+
+    let removeKeymapLayer: (() => void) | null = null
+    try {
+      const keymapAny = context.keymap as AnyObj | undefined
+      if (keymapAny && typeof keymapAny.layer === "function") {
+        const dispose = keymapAny.layer(() => ({
+          mode: "global",
+          priority: 10,
+          commands: [
+            {
+              id: "red.colored-tabs.toggle",
+              title: "Toggle Colored Tabs",
+              group: "Colored Tabs",
+              palette: true,
+              slash: { name: "colored-tabs" },
+              run: toggleEnabled,
+            },
+          ],
+          bindings: ["red.colored-tabs.toggle"],
+        }))
+        if (typeof dispose === "function") removeKeymapLayer = dispose
+      }
+    } catch {}
+
     context.renderer.on("frame", onFrame)
     return () => {
       try {
@@ -627,7 +738,12 @@ export default Plugin.define({
       try {
         if (postProcessAvailable) rendererAny.removePostProcessFn(postProcessFn)
       } catch {}
+      try {
+        if (removeKeymapLayer) removeKeymapLayer()
+      } catch {}
       rowBindings.clear()
+      boxSnapshots.clear()
+      fgSnapshots.clear()
     }
   },
 })
