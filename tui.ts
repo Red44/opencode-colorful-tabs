@@ -24,7 +24,9 @@
  */
 import { Plugin } from "@opencode/plugin/tui"
 import { appendFileSync } from "node:fs"
+import { createComponent } from "solid-js"
 import { buildPalette, jitterFor, rgbToHex, hexToRgb, type Rgb } from "./colors"
+import { SidebarOverview, type SidebarOverviewProps } from "./sidebar"
 
 type AnyObj = Record<string, any>
 
@@ -41,7 +43,7 @@ const OPTIONS_DEFAULTS = {
   recolorTitle: true,
   /** mirror the active tab color onto the prompt window (side dashes + agent name) */
   promptSync: true,
-  debug: true,
+  debug: false,
   throttleMs: 150,
 }
 
@@ -159,7 +161,6 @@ export default Plugin.define({
   async setup(context) {
     const options = { ...OPTIONS_DEFAULTS, ...(context.options ?? {}) }
     await loadRgbClass()
-    if (!context.ui.tabs.enabled()) return
 
     // ---- master switch (persisted; toggled via /colored-tabs) ----
     const [settings, updateSettings] = context.storage.store("settings-v1", {
@@ -208,6 +209,41 @@ export default Plugin.define({
         draft.next = (draft.next + 1) % 1_000_000
       }).catch(() => {})
       if (assign.bySession[sessionID] === undefined) assign.bySession[sessionID] = idx
+    }
+
+    // ---- utility-sidebar data ----
+    const vcsSyncRequested = new Set<string>()
+    const messageSyncRequested = new Set<string>()
+
+    function tokenTotal(usage: AnyObj | undefined): number | undefined {
+      if (!usage) return undefined
+      const cache = usage.cache ?? {}
+      const values = [usage.input, usage.output, usage.reasoning, cache.read, cache.write]
+      if (!values.some((value) => typeof value === "number" && Number.isFinite(value))) return undefined
+      return values.reduce((sum, value) => sum + (typeof value === "number" && Number.isFinite(value) ? value : 0), 0)
+    }
+
+    function latestOutputTps(messages: readonly AnyObj[], modelRef?: AnyObj): number | undefined {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const message = messages[i]
+        if (message?.type !== "assistant" || !message.tokens) continue
+        const messageModel = message.model
+        if (
+          modelRef && messageModel &&
+          (messageModel.id !== modelRef.id || messageModel.providerID !== modelRef.providerID)
+        ) continue
+        const output = Number(message.tokens.output ?? 0)
+        const started = Number(message.time?.streamed ?? message.time?.created)
+        const completed = Number(message.time?.completed)
+        if (!Number.isFinite(output) || output <= 0 || !Number.isFinite(started) || !Number.isFinite(completed)) continue
+        const seconds = (completed - started) / 1000
+        if (seconds > 0) return output / seconds
+      }
+      return undefined
+    }
+
+    function locationForSession(sessionID: string): AnyObj | undefined {
+      return context.data.session.get(sessionID)?.location ?? context.location ?? undefined
     }
 
     // ---- one tree walk: tab rows + the marked composer textarea ----
@@ -988,6 +1024,99 @@ export default Plugin.define({
       }
     } catch {}
 
+    // ---- utility sidebar: session branch, model, cumulative tokens, rate ----
+    const syncedVcsDirectories = new Set<string>()
+    const syncedMessageSessions = new Set<string>()
+    const removeSidebarSlot = context.ui.slot({
+      append: "sidebar.content",
+      render: ({ sessionID }) => {
+        if (!sessionID) return null
+
+        assignSession(sessionID)
+        const currentSession = () => context.data.session.get(sessionID)
+        const currentLocation = () => currentSession()?.location ?? context.location ?? undefined
+
+        const location = currentLocation()
+        const directory = location?.directory
+        const vcs = location ? context.data.location.vcs.info(location as any) : undefined
+        if (directory && !vcs?.branch?.current && !syncedVcsDirectories.has(directory)) {
+          syncedVcsDirectories.add(directory)
+          void context.data.location.vcs.sync(location as any).catch(() => {
+            syncedVcsDirectories.delete(directory)
+          })
+        }
+
+        const messages = context.data.session.message.list(sessionID) ?? []
+        if (messages.length === 0 && !syncedMessageSessions.has(sessionID)) {
+          syncedMessageSessions.add(sessionID)
+          void context.data.session.message.sync(sessionID).catch(() => {
+            syncedMessageSessions.delete(sessionID)
+          })
+        }
+
+        const modelRef = (): AnyObj | undefined => {
+          const sessionModel = currentSession()?.model as AnyObj | undefined
+          if (sessionModel?.id) return sessionModel
+          const selected = context.ui.model.current()
+          return selected ? { id: selected.modelID, providerID: selected.providerID } : undefined
+        }
+
+        const modelName = (): string | undefined => {
+          const ref = modelRef()
+          if (!ref?.id) return undefined
+          const modelInfo = currentLocation()
+            ? context.data.location.model.list(currentLocation() as any)?.find(
+                (model: any) => model.providerID === ref.providerID && model.modelID === ref.id,
+              )
+            : undefined
+          return modelInfo?.name ?? String(ref.id)
+        }
+
+        const outputTps = (): number | undefined => {
+          const ref = modelRef()
+          const messages = context.data.session.message.list(sessionID) ?? []
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const message = messages[i] as AnyObj
+            if (message.type !== "assistant") continue
+            if (
+              ref && message.model &&
+              (message.model.id !== ref.id || message.model.providerID !== ref.providerID)
+            ) continue
+            const output = Number(message.tokens?.output ?? 0) + Number(message.tokens?.reasoning ?? 0)
+            const started = Number(message.time?.created)
+            const firstToken = Number(message.time?.streamed)
+            const elapsedSeconds = (firstToken - started) / 1_000
+            if (!Number.isFinite(output) || output <= 0 || !Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0) continue
+            return output / elapsedSeconds
+          }
+          return undefined
+        }
+
+        const theme = () => {
+          const colors = context.theme as AnyObj
+          return {
+            text: colors.text?.base,
+            textMuted: colors.text?.muted,
+            primary: colors.text?.action?.primary?.base,
+            success: colors.text?.feedback?.success?.base,
+          }
+        }
+
+        return createComponent(SidebarOverview, {
+          branch: () => {
+            const here = currentLocation()
+            return here ? context.data.location.vcs.info(here as any)?.branch.current : undefined
+          },
+          model: modelName,
+          totalTokens: () => tokenTotal(currentSession()?.tokens as AnyObj | undefined),
+          outputTps,
+          status: () => context.data.session.status(sessionID),
+          accent: () => isEnabled() ? rgbToHex(colorFor(sessionID)) : undefined,
+          theme,
+        } satisfies SidebarOverviewProps)
+      },
+    })
+
     context.renderer.on("frame", onFrame)
     return () => {
       try {
@@ -998,6 +1127,9 @@ export default Plugin.define({
       } catch {}
       try {
         if (removeKeymapLayer) removeKeymapLayer()
+      } catch {}
+      try {
+        removeSidebarSlot()
       } catch {}
       // Restore pre-plugin styles from the snapshots BEFORE clearing them, so
       // a plugin disable/reload cannot strand colored borders/text behind.

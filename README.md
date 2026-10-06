@@ -1,7 +1,7 @@
-# colored-tabs
+# OpenCode Colorful Tabs + Utilities
 
-Per-tab identity colors for the OpenCode v2 TUI session tab strip, synced
-with the main prompt window.
+An OpenCode v2 TUI utility plugin: per-tab identity colors synced with the
+main prompt, plus a compact session overview in the supported sidebar slot.
 
 The TUI plugin API cannot restyle the built-in tab strip or register settings
 inside OpenCode's built-in **Open settings** menu. This plugin
@@ -29,6 +29,12 @@ bars visible even when long titles reach the edge.
   color of the prompt tells you which tab you are in without reading the
   tab strip.
 - Status indicators (busy/error dots) keep their own colors.
+- **Session overview** — adds a compact panel through OpenCode's supported
+  `sidebar.content` slot with the session Git branch, current model, cumulative
+  token total, output/reasoning tok/s for the current model, and running/idle
+  status. Tok/s is derived from the latest assistant message's token timing
+  (the API has no direct rate field); rows hide when the data is unavailable.
+  Branch is omitted for sessions whose location is not inside a Git repository.
 
 ## Plugin settings
 
@@ -43,7 +49,8 @@ registration hook).
 ## Install
 
 Already installed at `~/.config/opencode/plugins/colored-tabs/` — global
-plugin discovery loads it automatically. Requires tabs to be enabled
+plugin discovery loads it automatically. The session overview uses the
+official sidebar slot; tab coloring requires tabs enabled
 (`tabs.mode: on|auto` in `cli.json`).
 
 ## Options
@@ -72,7 +79,8 @@ change defaults:
 
 ## Files
 
-- `tui.ts` — TUI plugin: tree walk, tab matching, border/text overrides
+- `tui.ts` — TUI plugin: tab styling, prompt sync, utility data and slots
+- `sidebar.tsx` — compact session overview panel
 - `colors.ts` — OKLCH palette engine (zero dependencies)
 
 ## Notes
