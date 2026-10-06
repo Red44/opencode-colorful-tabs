@@ -546,7 +546,7 @@ export default Plugin.define({
       } catch {}
     }
 
-    /** paint only the main composer border and its one-row closing cap */
+    /** paint the composer sides; leave the one-row bottom closing cap native */
     function paintPromptEdges(buffer: any): void {
       for (const [box, hex] of promptEdgeBindings) {
         try {
@@ -764,7 +764,10 @@ export default Plugin.define({
         return changed
       }
 
-      const boxes = [prompt.mainBorder, prompt.closingCap].filter(isBindable)
+      // The closing cap is the row immediately below the composer. Painting it
+      // with a vertical glyph extends both side bars one row too far, so keep
+      // its native bottom-corner rendering untouched.
+      const boxes = [prompt.mainBorder].filter(isBindable)
       const live = new Set<object>()
       for (const box of boxes) {
         live.add(box)
