@@ -468,19 +468,20 @@ export default Plugin.define({
      * so title text can no longer overwrite the bar. drawText requires an
      * RGBA color, so convert via RGBA.fromHex() directly.
      */
-    function paintCell(buffer: any, x: number, y: number, hex: string): void {
+    function paintCell(buffer: any, x: number, y: number, hex: string, glyph = "┃"): void {
       const bw = typeof buffer?.width === "number" ? buffer.width : Number.POSITIVE_INFINITY
       const bh = typeof buffer?.height === "number" ? buffer.height : Number.POSITIVE_INFINITY
       if (x < 0 || y < 0 || x >= bw || y >= bh) return
       if (!RGBACls || typeof RGBACls.fromHex !== "function") return
       try {
-        buffer.drawText("┃", x, y, RGBACls.fromHex(hex))
+        buffer.drawText(glyph, x, y, RGBACls.fromHex(hex))
       } catch {}
     }
 
     // ---- vertical tab edge bindings: row -> owning session ----
     const rowBindings = new Map<object, { sessionID: string }>()
     const promptEdgeBindings = new Map<object, string>()
+    const promptCapBindings = new Map<object, string>()
     const promptLabelBindings = new Map<object, string>()
     const rendererAny = context.renderer as AnyObj
     const postProcessAvailable =
@@ -546,7 +547,7 @@ export default Plugin.define({
       } catch {}
     }
 
-    /** paint the composer sides; leave the one-row bottom closing cap native */
+    /** paint full composer sides and half-height colored bottom-corner joins */
     function paintPromptEdges(buffer: any): void {
       for (const [box, hex] of promptEdgeBindings) {
         try {
@@ -565,6 +566,20 @@ export default Plugin.define({
             paintCell(buffer, x0, y0 + row, hex)
             paintCell(buffer, right, y0 + row, hex)
           }
+        } catch {}
+      }
+      for (const [cap, hex] of promptCapBindings) {
+        try {
+          const b = cap as AnyObj
+          if (!isBindable(b)) continue
+          const x0 = b.screenX
+          const y = b.screenY
+          const w = b.width
+          if (typeof x0 !== "number" || typeof y !== "number" || typeof w !== "number" || w < 2) continue
+          // ╹ extends the side bar halfway into the bottom-cap row without
+          // carrying a full extra row below the composer.
+          paintCell(buffer, x0, y, hex, "╹")
+          paintCell(buffer, x0 + w - 1, y, hex, "╹")
         } catch {}
       }
     }
@@ -651,6 +666,7 @@ export default Plugin.define({
       // right-edge bars must not repaint on the next post-process pass
       rowBindings.clear()
       promptEdgeBindings.clear()
+      promptCapBindings.clear()
       promptLabelBindings.clear()
       debug(options.debug, "restore complete")
       process.nextTick(() => {
@@ -756,8 +772,9 @@ export default Plugin.define({
     function syncPrompt(prompt: PromptParts | null, activeHex: string | null): boolean {
       let changed = false
       if (!options.promptSync || !activeHex || !prompt) {
-        if (promptEdgeBindings.size > 0 || promptLabelBindings.size > 0) {
+        if (promptEdgeBindings.size > 0 || promptCapBindings.size > 0 || promptLabelBindings.size > 0) {
           promptEdgeBindings.clear()
+          promptCapBindings.clear()
           promptLabelBindings.clear()
           changed = true
         }
@@ -780,6 +797,19 @@ export default Plugin.define({
       for (const box of [...promptEdgeBindings.keys()]) {
         if (!live.has(box)) {
           promptEdgeBindings.delete(box)
+          changed = true
+        }
+      }
+      if (isBindable(prompt.closingCap)) {
+        const previous = promptCapBindings.get(prompt.closingCap)
+        if (previous !== activeHex) {
+          promptCapBindings.set(prompt.closingCap, activeHex)
+          changed = true
+        }
+      }
+      for (const cap of [...promptCapBindings.keys()]) {
+        if (cap !== prompt.closingCap || !isBindable(cap)) {
+          promptCapBindings.delete(cap)
           changed = true
         }
       }
