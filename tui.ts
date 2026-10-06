@@ -41,7 +41,7 @@ const OPTIONS_DEFAULTS = {
   recolorTitle: true,
   /** mirror the active tab color onto the prompt window (side dashes + agent name) */
   promptSync: true,
-  debug: false,
+  debug: true,
   throttleMs: 150,
 }
 
@@ -214,6 +214,7 @@ export default Plugin.define({
     interface WalkResult {
       candidates: Candidate[]
       prompt: PromptParts | null
+      renderables: any[]
     }
 
     function childrenOf(node: any): any[] {
@@ -380,7 +381,7 @@ export default Plugin.define({
         cap: [prompt.closingCap.screenX, prompt.closingCap.screenY, prompt.closingCap.width, prompt.closingCap.height],
         metadata: prompt.metadata.map((node) => textOf(node).slice(0, 60)),
       })
-      return { candidates, prompt }
+      return { candidates, prompt, renderables }
     }
 
     /** longest text inside a row (the tab title) */
@@ -769,7 +770,7 @@ export default Plugin.define({
     }
 
     /** prompt composer mirrors the active tab: both edges + agent name */
-    function syncPrompt(prompt: PromptParts | null, activeHex: string | null): boolean {
+    function syncPrompt(prompt: PromptParts | null, renderables: any[], activeHex: string | null): boolean {
       let changed = false
       if (!options.promptSync || !activeHex || !prompt) {
         if (promptEdgeBindings.size > 0 || promptCapBindings.size > 0 || promptLabelBindings.size > 0) {
@@ -823,6 +824,17 @@ export default Plugin.define({
         const names = new Set(agents.map((a) => normalize(String(a?.name ?? ""))).filter(Boolean))
         names.add("orchestrator")
         const labels = prompt.metadata.flatMap((node) => findExactTextNodes(node, names)).filter(isBindable)
+        const activeNames = new Set(labels.map((node) => normalize(textOf(node).trim())).filter(Boolean))
+        const sidebarLabels = renderables.filter((node) => {
+          const label = normalize(textOf(node).trim())
+          return (
+            activeNames.has(label) &&
+            typeof node?.screenX === "number" &&
+            node.screenX >= (context.renderer.width ?? 0) * 0.7 &&
+            isBindable(node)
+          )
+        })
+        labels.push(...sidebarLabels)
         const liveLabels = new Set<object>()
         for (const label of labels) {
           const node = label as object
@@ -881,7 +893,7 @@ export default Plugin.define({
         if (!tabs || tabs.length === 0) return
         for (const t of tabs) assignSession(t.sessionID)
 
-        const { candidates, prompt } = walkTree()
+        const { candidates, prompt, renderables } = walkTree()
         const matches = matchTabs(candidates, tabs as unknown as AnyObj[])
         debug(options.debug, "prompt found", !!prompt, "metadata", prompt ? textOf(prompt.metadata).slice(0, 80) : "")
         debug(options.debug, "tabs", tabs.length, "matches", matches.size, "active", tabs.find((t: any) => t.active)?.title?.slice?.(0, 18))
@@ -893,7 +905,7 @@ export default Plugin.define({
         for (const [tab, cand] of matches) {
           if (applyRow(cand.row, tab, cand.horizontal, colorFor(String(tab.sessionID)))) dirty = true
         }
-        if (syncPrompt(prompt, activeHex)) dirty = true
+        if (syncPrompt(prompt, renderables, activeHex)) dirty = true
 
         // Right-edge bars paint in the post-process pass from current layout
         // geometry; no per-frame render requests. Ask for a render only when
