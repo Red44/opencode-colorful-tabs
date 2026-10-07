@@ -1183,6 +1183,12 @@ export default Plugin.define({
           { id: "red.utilities.toggle-enter", bind: "return", run: () => applyUtility(utilityItems[dialogHighlight()].field) },
           { id: "red.utilities.toggle-space", bind: "space", run: () => applyUtility(utilityItems[dialogHighlight()].field) },
         ],
+        bindings: [
+          "red.utilities.up",
+          "red.utilities.down",
+          "red.utilities.toggle-enter",
+          "red.utilities.toggle-space",
+        ],
       }))
     } catch {}
 

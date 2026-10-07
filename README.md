@@ -40,10 +40,11 @@ bars visible even when long titles reach the edge.
 
 Colored tabs and the sidebar rows are enabled by default. Open the command
 palette (`Ctrl+P`) and choose **OpenCode Utilities Settings**, or run
-`/utilities` (also `/colored-tabs`). Select an item to toggle it; the dialog
-reopens with the updated state. Choices persist across TUI restarts. This is a
-plugin-owned settings dialog, not an entry in OpenCode's built-in **Open
-settings** menu (the plugin API has no settings registration hook).
+`/utilities` (also `/colored-tabs`). Use ↑/↓ to select a row and Enter or Space
+to toggle it in place; the dialog stays open until Esc. Choices persist across
+TUI restarts. This is a plugin-owned settings dialog, not an entry in OpenCode's
+built-in **Open settings** menu (the plugin API has no settings registration
+hook).
 
 ## Install
 
