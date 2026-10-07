@@ -25,13 +25,49 @@
  *      usage, output rate, and session status for the current session.
  */
 import { Plugin } from "@opencode/plugin/tui"
-import { appendFileSync } from "node:fs"
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import path from "node:path"
 import { createComponent, createSignal } from "solid-js"
+import { createStore } from "solid-js/store"
 import { buildPalette, jitterFor, rgbToHex, hexToRgb, type Rgb } from "./colors"
 import { SidebarOverview, type SidebarOverviewProps } from "./sidebar"
 
 type AnyObj = Record<string, any>
 type SidebarField = "branch" | "tokens" | "rate" | "status"
+
+/** Plugin-owned settings file: TUI storage.store is not durable in 2.0.23. */
+const SETTINGS_FILE = path.join(
+  homedir(),
+  ".config/opencode/plugins/colored-tabs/settings.json",
+)
+
+interface PersistedState {
+  enabled?: boolean
+  sidebar?: Record<string, boolean>
+  assign?: { next: number; bySession: Record<string, number> }
+}
+
+function loadPersistedState(): PersistedState {
+  try {
+    const raw = readFileSync(SETTINGS_FILE, "utf8")
+    return JSON.parse(raw) as PersistedState
+  } catch {
+    return {}
+  }
+}
+
+let saveTimer: ReturnType<typeof setTimeout> | null = null
+function persistStateSoon(getState: () => AnyObj): void {
+  if (saveTimer) return // coalesce bursts
+  saveTimer = setTimeout(() => {
+    saveTimer = null
+    try {
+      mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true })
+      writeFileSync(SETTINGS_FILE, JSON.stringify(getState(), null, 2))
+    } catch {}
+  }, 150)
+}
 
 const OPTIONS_DEFAULTS = {
   /** master switch for all coloring (persisted; toggled via /colored-tabs) */
@@ -166,23 +202,32 @@ export default Plugin.define({
     const options = { ...OPTIONS_DEFAULTS, ...(context.options ?? {}) }
     await loadRgbClass()
 
-    // ---- master switch and utility display settings (persisted) ----
+    // ---- master switch and utility display settings (persisted to a JSON
+    // file next to the plugin: TUI plugin storage.store does not reliably
+    // persist in 2.0.23, and multiple TUI instances echo stale state over
+    // live-sync, so the file is the single source of truth) ----
+    const persisted = loadPersistedState()
     const sidebarDefaults = {
       ...OPTIONS_DEFAULTS.sidebar,
       ...((options as AnyObj).sidebar ?? {}),
     }
-    const [settings, updateSettings] = context.storage.store("settings-v1", {
-      initial: {
-        enabled: options.enabled !== false,
-        sidebar: sidebarDefaults,
-      },
+    const [settings, setSettings] = createStore<{
+      enabled: boolean
+      sidebar: Record<SidebarField, boolean>
+    }>({
+      enabled: persisted.enabled !== false,
+      sidebar: { ...sidebarDefaults, ...(persisted.sidebar ?? {}) },
     })
     const isEnabled = (): boolean => settings.enabled !== false
-    const isSidebarFieldEnabled = (field: SidebarField): boolean => (settings as AnyObj).sidebar?.[field] !== false
+    const isSidebarFieldEnabled = (field: SidebarField): boolean => settings.sidebar?.[field] !== false
 
-    // ---- session -> palette index assignment (durable, rotates at 10) ----
-    const [assign, updateAssign] = context.storage.store("assign-v2", {
-      initial: { next: 0, bySession: {} as Record<string, number> },
+    // ---- session -> palette index assignment (rotates at 10) ----
+    const [assign, setAssign] = createStore<{
+      next: number
+      bySession: Record<string, number>
+    }>({
+      next: persisted.assign?.next ?? 0,
+      bySession: persisted.assign?.bySession ?? {},
     })
     const colorCache = new Map<string, Rgb>()
     let palette: { hex: string; anchor: ReturnType<typeof buildPalette>[number]["anchor"] }[] = []
@@ -215,12 +260,14 @@ export default Plugin.define({
       if (assign.bySession[sessionID] !== undefined) return
       ensurePalette()
       const idx = assign.next % palette.length
-      updateAssign((draft) => {
-        if (draft.bySession[sessionID] !== undefined) return
-        draft.bySession[sessionID] = draft.next % 10
-        draft.next = (draft.next + 1) % 1_000_000
-      }).catch(() => {})
+      setAssign("bySession", sessionID, assign.next % 10)
+      setAssign("next", (assign.next + 1) % 1_000_000)
       if (assign.bySession[sessionID] === undefined) assign.bySession[sessionID] = idx
+      persistStateSoon(() => ({
+        enabled: settings.enabled,
+        sidebar: { ...settings.sidebar },
+        assign: { next: assign.next, bySession: { ...assign.bySession } },
+      }))
     }
 
     // ---- utility-sidebar data ----
@@ -1078,56 +1125,65 @@ export default Plugin.define({
     }
 
     // ---- plugin-owned utility settings dialog; field toggles are persistent ----
+    // Enter resolves with the highlighted row, the toggle is applied, and the
+    // dialog re-opens so several rows can be changed in one session.
     const openSettings = async (): Promise<void> => {
       type SettingChoice = "tabs" | SidebarField
-      while (true) {
-        const optionsList = [
-          {
-            title: `${isEnabled() ? "✓" : "○"} Colored tab identity + prompt sync`,
-            value: "tabs" as const,
-            description: "Color tab borders, titles, and the active prompt.",
-          },
-          ...([
-            ["branch", "Git branch"],
-            ["tokens", "Total tokens"],
-            ["rate", "Output rate"],
-            ["status", "Session status"],
-          ] as const).map(([field, label]) => ({
-            title: `${isSidebarFieldEnabled(field) ? "✓" : "○"} ${label}`,
-            value: field,
-            description: `${isSidebarFieldEnabled(field) ? "Hide" : "Show"} ${label.toLowerCase()} in the session sidebar.`,
-          })),
-        ]
-        const choice = await context.ui.dialog.select<SettingChoice>({
-          title: "OpenCode Utilities Settings",
-          placeholder: "Select an item to toggle · Esc to close",
-          current: "tabs",
-          options: optionsList,
-        })
-        if (choice === undefined) return
-
+      const applyChoice = (choice: SettingChoice): void => {
         if (choice === "tabs") {
           const next = !isEnabled()
-          settings.enabled = next
-          await updateSettings((draft) => {
-            draft.enabled = next
-          })
+          setSettings("enabled", next)
           lastRun = 0
         } else {
           const next = !isSidebarFieldEnabled(choice)
-          const liveSettings = settings as AnyObj
-          liveSettings.sidebar ??= { ...sidebarDefaults }
-          liveSettings.sidebar[choice] = next
-          await updateSettings((draft) => {
-            const mutable = draft as AnyObj
-            mutable.sidebar ??= { ...sidebarDefaults }
-            mutable.sidebar[choice] = next
-          })
+          setSettings("sidebar", choice, next)
         }
+        persistStateSoon(() => ({ enabled: settings.enabled, sidebar: { ...settings.sidebar }, assign: { ...assign } }))
         try {
           context.renderer.requestRender()
         } catch {}
       }
+
+      const optionsList: Array<{ title: string; value: SettingChoice; description: string }> = [
+        {
+          title: "Colored tab identity + prompt sync",
+          value: "tabs",
+          description: "Color tab borders, titles, and the active prompt.",
+        },
+        ...([
+          ["branch", "Git branch"],
+          ["tokens", "Total tokens"],
+          ["rate", "Output rate"],
+          ["status", "Session status"],
+        ] as const).map(([field, label]) => ({
+          title: label,
+          value: field,
+          description: `${label} in the session sidebar.`,
+        })),
+      ]
+
+      // Space is bound as a dialog *action*: per docs an action does not
+      // close the dialog or settle the promise, so the menu stays open and
+      // several rows can be toggled in one session. Enter applies the
+      // highlighted row and closes.
+      const choice = await context.ui.dialog.select<SettingChoice>({
+        title: "OpenCode Utilities Settings",
+        placeholder: "↑↓ select · Space toggles · Enter/Esc closes",
+        current: "tabs",
+        options: optionsList,
+        actions: [
+          {
+            bind: "space",
+            title: "Toggle selected",
+            onTrigger: (value) => {
+              debug(true, "space action fired with:", String(value))
+              if (value) applyChoice(value as SettingChoice)
+            },
+          },
+        ],
+      })
+      // Enter path: apply the highlighted row, then close.
+      if (choice) applyChoice(choice)
     }
 
     let removeKeymapLayer: (() => void) | null = null

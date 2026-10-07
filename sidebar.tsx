@@ -135,7 +135,7 @@ function clampLabel(text: string): string {
 // Building blocks
 // ---------------------------------------------------------------------------
 
-function Heading(props: { bar: SidebarColor; color: SidebarColor; expanded: boolean; toggle: () => void }): JSX.Element {
+function Heading(props: { color: SidebarColor; expanded: boolean; toggle: () => void }): JSX.Element {
   const onKeyDown = (event: any) => {
     const key = String(event?.name ?? event?.key ?? "").toLowerCase()
     if (key === "enter" || key === "space" || key === " ") props.toggle()
@@ -149,9 +149,6 @@ function Heading(props: { bar: SidebarColor; color: SidebarColor; expanded: bool
       onKeyDown={onKeyDown}
     >
       <text fg={props.color}>{props.expanded ? "▼" : "▶"}</text>
-      <text flexShrink={0} fg={props.bar}>
-        {BAR}
-      </text>
       <text fg={props.color}>
         <b>Session</b>
       </text>
@@ -236,7 +233,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
   return (
     <Show when={hasAny()}>
       <box gap={1}>
-        <Heading bar={accent()} color={colors().text} expanded={expanded()} toggle={toggle} />
+        <Heading color={colors().text} expanded={expanded()} toggle={toggle} />
         <Show when={expanded()}>
           <box>
             <Show when={visible("branch") && branch()}>
