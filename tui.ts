@@ -32,6 +32,7 @@ import { createComponent, createSignal } from "solid-js"
 import { createStore } from "solid-js/store"
 import { buildPalette, jitterFor, rgbToHex, hexToRgb, type Rgb } from "./colors"
 import { SidebarOverview, type SidebarOverviewProps } from "./sidebar"
+import { UtilitiesSettingsDialog, type DialogField } from "./settings-dialog"
 
 type AnyObj = Record<string, any>
 type SidebarField = "branch" | "tokens" | "rate" | "status"
@@ -1115,66 +1116,110 @@ export default Plugin.define({
       } catch {}
     }
 
-    // ---- plugin-owned utility settings dialog; field toggles are persistent ----
-    // Enter resolves with the highlighted row, the toggle is applied, and the
-    // dialog re-opens so several rows can be changed in one session.
-    const openSettings = async (): Promise<void> => {
-      type SettingChoice = "tabs" | SidebarField
-      const applyChoice = (choice: SettingChoice): void => {
-        if (choice === "tabs") {
-          const next = !isEnabled()
-          setSettings("enabled", next)
-          lastRun = 0
-        } else {
-          const next = !isSidebarFieldEnabled(choice)
-          setSettings("sidebar", choice, next)
-        }
-        persistStateSoon(() => ({ enabled: settings.enabled, sidebar: { ...settings.sidebar }, assign: { ...assign } }))
-        try {
-          context.renderer.requestRender()
-        } catch {}
+    // ---- plugin-owned utility settings dialog; toggles are persistent ----
+    // A custom JSX dialog: rows toggle in place (Enter/Space/click) and the
+    // dialog STAYS OPEN. The built-in select always closes on Enter, which
+    // made real settings interaction impossible.
+    type UtilitySetting = "tabs" | SidebarField
+    const utilityItems: Array<{ field: UtilitySetting; label: string; description: string }> = [
+      {
+        field: "tabs",
+        label: "Colored tab identity + prompt sync",
+        description: "Color tab borders, titles, and the active prompt.",
+      },
+      {
+        field: "branch",
+        label: "Git branch",
+        description: "Branch of the current session in the sidebar.",
+      },
+      {
+        field: "tokens",
+        label: "Total tokens",
+        description: "Cumulative token usage in the sidebar.",
+      },
+      {
+        field: "rate",
+        label: "Output rate",
+        description: "Live and per-response tok/s in the sidebar.",
+      },
+      {
+        field: "status",
+        label: "Session status",
+        description: "Running/idle indicator in the sidebar.",
+      },
+    ]
+    const isUtilityEnabled = (field: UtilitySetting): boolean =>
+      field === "tabs" ? isEnabled() : isSidebarFieldEnabled(field)
+    const applyUtility = (field: UtilitySetting): void => {
+      const next = !isUtilityEnabled(field)
+      if (field === "tabs") {
+        setSettings("enabled", next)
+        lastRun = 0
+      } else {
+        setSettings("sidebar", field as SidebarField, next)
       }
+      persistStateSoon(() => ({ enabled: settings.enabled, sidebar: { ...settings.sidebar }, assign: { ...assign } }))
+      try {
+        context.renderer.requestRender()
+      } catch {}
+    }
 
-      const optionsList: Array<{ title: string; value: SettingChoice; description: string }> = [
-        {
-          title: "Colored tab identity + prompt sync",
-          value: "tabs",
-          description: "Color tab borders, titles, and the active prompt.",
-        },
-        ...([
-          ["branch", "Git branch"],
-          ["tokens", "Total tokens"],
-          ["rate", "Output rate"],
-          ["status", "Session status"],
-        ] as const).map(([field, label]) => ({
-          title: label,
-          value: field,
-          description: `${label} in the session sidebar.`,
-        })),
-      ]
+    // While the dialog is open the host switches keyboard input to "modal"
+    // mode (only Esc/Ctrl+C by default). Registering our navigation layer in
+    // that same mode is what makes the rows actually selectable.
+    const [dialogOpen, setDialogOpen] = createSignal(false)
+    const [dialogHighlight, setDialogHighlight] = createSignal(0)
 
-      // Space is bound as a dialog *action*: per docs an action does not
-      // close the dialog or settle the promise, so the menu stays open and
-      // several rows can be toggled in one session. Enter applies the
-      // highlighted row and closes.
-      const choice = await context.ui.dialog.select<SettingChoice>({
-        title: "OpenCode Utilities Settings",
-        placeholder: "↑↓ select · Space toggles · Enter/Esc closes",
-        current: "tabs",
-        options: optionsList,
-        actions: [
-          {
-            bind: "space",
-            title: "Toggle selected",
-            onTrigger: (value) => {
-              debug(true, "space action fired with:", String(value))
-              if (value) applyChoice(value as SettingChoice)
-            },
-          },
+    let removeDialogKeymap: (() => void) | null = null
+    try {
+      const keymapAny = context.keymap as AnyObj
+      removeDialogKeymap = keymapAny.layer(() => ({
+        mode: "modal",
+        enabled: dialogOpen(),
+        priority: 50,
+        commands: [
+          { id: "red.utilities.up", bind: "up", run: () => setDialogHighlight((i) => (i - 1 + utilityItems.length) % utilityItems.length) },
+          { id: "red.utilities.down", bind: "down", run: () => setDialogHighlight((i) => (i + 1) % utilityItems.length) },
+          { id: "red.utilities.toggle-enter", bind: "return", run: () => applyUtility(utilityItems[dialogHighlight()].field) },
+          { id: "red.utilities.toggle-space", bind: "space", run: () => applyUtility(utilityItems[dialogHighlight()].field) },
         ],
-      })
-      // Enter path: apply the highlighted row, then close.
-      if (choice) applyChoice(choice)
+      }))
+    } catch {}
+
+    const closeUtilities = (): void => {
+      setDialogOpen(false)
+      try {
+        context.ui.dialog.clear()
+      } catch {}
+    }
+
+    const openSettings = (): void => {
+      if (dialogOpen()) return // already open
+      setDialogHighlight(0)
+      setDialogOpen(true)
+
+      const theme = context.theme as AnyObj
+      const highlightBg = theme?.background?.raised?.high
+
+      context.ui.dialog.show(
+        () =>
+          createComponent(UtilitiesSettingsDialog, {
+            theme,
+            highlightBg,
+            highlight: dialogHighlight,
+            rows: utilityItems.map((item) => ({
+              field: item.field as DialogField,
+              label: item.label,
+              description: item.description,
+            })),
+            isEnabled: (field) => isUtilityEnabled(field as UtilitySetting),
+            onMove: (delta) => setDialogHighlight((i) => (i + delta + utilityItems.length) % utilityItems.length),
+            onToggle: (field) => applyUtility(field as UtilitySetting),
+          }),
+        () => {
+          setDialogOpen(false)
+        },
+      )
     }
 
     let removeKeymapLayer: (() => void) | null = null
