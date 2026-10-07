@@ -273,87 +273,104 @@ export default Plugin.define({
     // ---- utility-sidebar data ----
     const vcsSyncRequested = new Set<string>()
     const messageSyncRequested = new Set<string>()
-    interface LiveStepRate {
+    /**
+     * Per-turn tok/s tracker. Matches OpenCode's own footer math: a turn
+     * aggregates all assistant steps after the latest input; each step only
+     * contributes its streamed time (created → streamed), so tool execution
+     * time between steps is excluded. During streaming, the rate is a live
+     * character-based estimate that freezes while tools run.
+     */
+    interface ActiveStep {
       sessionID: string
-      modelKey: string
       startedAt: number
       streamedAt?: number
-      outputChars: number
-      lastPublishedAt: number
+      textChars: number
+      reasoningChars: number
+      lastEstimateAt: number
     }
-    interface ResponseRate {
-      modelKey: string
+    interface TurnRate {
       value: number
-      estimated: boolean
+      exact: boolean
     }
-    const liveSteps = new Map<string, LiveStepRate>()
-    const responseRates = new Map<string, ResponseRate>()
+    interface TurnAccumulator {
+      output: number
+      durationMs: number
+    }
+    const activeSteps = new Map<string, ActiveStep>() // assistantMessageID -> step
+    const turnAccumulators = new Map<string, TurnAccumulator>() // sessionID -> aggregate
+    const turnRates = new Map<string, TurnRate>() // sessionID -> displayed rate
     const [rateRevision, setRateRevision] = createSignal(0)
-    const modelKey = (model: AnyObj | undefined): string =>
-      model ? `${String(model.providerID ?? "")}/${String(model.id ?? model.modelID ?? "")}` : ""
 
     const stopRateEvents = [
       context.data.on("session.step.started", (event) => {
         const data = event.data as AnyObj
         const assistantMessageID = String(data.assistantMessageID ?? "")
         if (!assistantMessageID) return
-        liveSteps.set(assistantMessageID, {
+        activeSteps.set(assistantMessageID, {
           sessionID: String(data.sessionID),
-          modelKey: modelKey(data.model),
           startedAt: Number(data.started ?? event.created),
-          outputChars: 0,
-          lastPublishedAt: 0,
+          textChars: 0,
+          reasoningChars: 0,
+          lastEstimateAt: 0,
         })
-        if (responseRates.get(String(data.sessionID))?.modelKey === modelKey(data.model)) {
-          responseRates.delete(String(data.sessionID))
-        }
         setRateRevision((revision) => revision + 1)
       }),
       context.data.on("session.step.streamed", (event) => {
-        const assistantMessageID = String(event.data.assistantMessageID ?? "")
-        const step = liveSteps.get(assistantMessageID)
+        const step = activeSteps.get(String(event.data.assistantMessageID ?? ""))
         if (step && step.streamedAt === undefined) step.streamedAt = Number(event.created)
+      }),
+      context.data.on("session.idle", (event) => {
+        // Turn boundary: the next turn starts its own aggregate. The last
+        // rate stays displayed until a new response begins.
+        turnAccumulators.delete(String(event.data.sessionID ?? ""))
       }),
     ]
 
-    const updateLiveRate = (event: AnyObj): void => {
+    const updateLiveEstimate = (event: AnyObj, isReasoning: boolean): void => {
       const data = event.data as AnyObj
-      const step = liveSteps.get(String(data.assistantMessageID ?? ""))
+      const step = activeSteps.get(String(data.assistantMessageID ?? ""))
       if (!step || step.sessionID !== String(data.sessionID)) return
-      if (step.streamedAt === undefined) step.streamedAt = Number(event.created)
-      step.outputChars += String(data.delta ?? "").length
+      if (step.streamedAt === undefined) return
+      const chars = String(data.delta ?? "").length
+      if (chars <= 0) return
+      if (isReasoning) step.reasoningChars += chars
+      else step.textChars += chars
+
       const now = Date.now()
-      const elapsedSeconds = (now - (step.streamedAt ?? step.startedAt)) / 1_000
-      if (step.outputChars <= 0 || elapsedSeconds <= 0) return
-      // Bound redraws during high-frequency deltas while keeping the rate live.
-      if (now - step.lastPublishedAt < 100) return
-      step.lastPublishedAt = now
-      responseRates.set(step.sessionID, {
-        modelKey: step.modelKey,
-        value: step.outputChars / 4 / elapsedSeconds,
-        estimated: true,
-      })
+      if (now - step.lastEstimateAt < 150) return // bound redraws, keep it live
+      step.lastEstimateAt = now
+      const elapsedSeconds = (now - step.streamedAt) / 1_000
+      if (elapsedSeconds <= 0.2) return
+      const tokens = (step.textChars + step.reasoningChars) / 4
+      if (tokens < 2) return
+      turnRates.set(step.sessionID, { value: tokens / elapsedSeconds, exact: false })
       setRateRevision((revision) => revision + 1)
     }
 
     stopRateEvents.push(
-      context.data.on("session.text.delta", updateLiveRate),
-      context.data.on("session.reasoning.delta", updateLiveRate),
+      context.data.on("session.text.delta", (event) => updateLiveEstimate(event, false)),
+      context.data.on("session.reasoning.delta", (event) => updateLiveEstimate(event, true)),
       context.data.on("session.step.ended", (event) => {
         const data = event.data as AnyObj
         const assistantMessageID = String(data.assistantMessageID ?? "")
-        const step = liveSteps.get(assistantMessageID)
+        const step = activeSteps.get(assistantMessageID)
         if (!step || step.sessionID !== String(data.sessionID)) return
-        liveSteps.delete(assistantMessageID)
+        activeSteps.delete(assistantMessageID)
+        if (step.streamedAt === undefined) return // no visible streaming this step
+
+        const streamedMs = Math.max(0, Number(event.created) - step.streamedAt)
         const tokens = data.tokens as AnyObj | undefined
         const output = Number(tokens?.output ?? 0) + Number(tokens?.reasoning ?? 0)
-        const elapsedSeconds = (Number(event.created) - (step.streamedAt ?? step.startedAt)) / 1_000
-        if (output > 0 && Number.isFinite(elapsedSeconds) && elapsedSeconds > 0) {
-          responseRates.set(step.sessionID, {
-            modelKey: step.modelKey,
-            value: output / elapsedSeconds,
-            estimated: false,
-          })
+        const accumulator = turnAccumulators.get(step.sessionID) ?? { output: 0, durationMs: 0 }
+        accumulator.output += output
+        accumulator.durationMs += streamedMs
+        turnAccumulators.set(step.sessionID, accumulator)
+
+        // Ignore micro-steps (<300 ms streamed): their timing is noise.
+        if (accumulator.durationMs < 300 || accumulator.output <= 0) return
+        const rate = accumulator.output / (accumulator.durationMs / 1_000)
+        if (Number.isFinite(rate) && rate > 0 && rate <= 400) {
+          turnRates.set(step.sessionID, { value: rate, exact: true })
         }
         setRateRevision((revision) => revision + 1)
       }),
@@ -367,35 +384,9 @@ export default Plugin.define({
       return values.reduce((sum, value) => sum + (typeof value === "number" && Number.isFinite(value) ? value : 0), 0)
     }
 
-    function latestHistoricalRate(messages: readonly AnyObj[], modelRef?: AnyObj): ResponseRate | undefined {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const message = messages[i]
-        if (message?.type !== "assistant" || !message.tokens) continue
-        const messageModel = message.model
-        if (
-          modelRef && messageModel &&
-          (messageModel.id !== modelRef.id || messageModel.providerID !== modelRef.providerID)
-        ) continue
-        const output = Number(message.tokens.output ?? 0) + Number(message.tokens.reasoning ?? 0)
-        const started = Number(message.time?.created)
-        const completed = Number(message.time?.completed)
-        if (!Number.isFinite(output) || output <= 0 || !Number.isFinite(started) || !Number.isFinite(completed)) continue
-        const seconds = (completed - started) / 1000
-        if (seconds > 0) return { modelKey: modelKey(message.model), value: output / seconds, estimated: true }
-      }
-      return undefined
-    }
-
-    function readOutputRate(sessionID: string, ref?: AnyObj): ResponseRate | undefined {
+    function readOutputRate(sessionID: string): TurnRate | undefined {
       rateRevision() // make the sidebar accessor reactive to streaming deltas/events
-      const key = modelKey(ref)
-      const active = [...liveSteps.values()].find((step) => step.sessionID === sessionID && (!key || step.modelKey === key))
-      const latest = responseRates.get(sessionID)
-      if (active) return latest?.modelKey === active.modelKey ? latest : undefined
-      if (latest && (!key || latest.modelKey === key)) return latest
-      const messages = context.data.session.message.list(sessionID) ?? []
-      const fallback = latestHistoricalRate(messages as AnyObj[], ref)
-      return fallback && (!key || fallback.modelKey === key) ? fallback : undefined
+      return turnRates.get(sessionID)
     }
 
     function locationForSession(sessionID: string): AnyObj | undefined {
@@ -1246,9 +1237,9 @@ export default Plugin.define({
           return selected ? { id: selected.modelID, providerID: selected.providerID } : undefined
         }
 
-        const readRate = () => readOutputRate(sessionID, modelRef())
+        const readRate = () => readOutputRate(sessionID)
         const outputTps = () => readRate()?.value
-        const outputTpsEstimated = () => readRate()?.estimated
+        const outputTpsEstimated = () => readRate()?.exact === false
 
         const theme = () => {
           const colors = context.theme as AnyObj
@@ -1300,8 +1291,11 @@ export default Plugin.define({
           stop()
         } catch {}
       }
-      liveSteps.clear()
-      responseRates.clear()
+      try {
+        activeSteps.clear()
+        turnAccumulators.clear()
+        turnRates.clear()
+      } catch {}
       // Restore pre-plugin styles from the snapshots BEFORE clearing them, so
       // a plugin disable/reload cannot strand colored borders/text behind.
       // restoreOriginalState() also clears the snapshots, the row bindings,
