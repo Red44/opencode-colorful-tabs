@@ -21,18 +21,22 @@
  *      dash and the agent name in the prompt footer ("Orchestrator …")
  *      are recolored to the active tab's color — the prompt itself tells
  *      you which tab you are in without reading the tab strip.
+ *   4. The supported sidebar.content slot shows Git branch, model, token
+ *      usage, output rate, and session status for the current session.
  */
 import { Plugin } from "@opencode/plugin/tui"
 import { appendFileSync } from "node:fs"
-import { createComponent } from "solid-js"
+import { createComponent, createSignal } from "solid-js"
 import { buildPalette, jitterFor, rgbToHex, hexToRgb, type Rgb } from "./colors"
 import { SidebarOverview, type SidebarOverviewProps } from "./sidebar"
 
 type AnyObj = Record<string, any>
+type SidebarField = "branch" | "tokens" | "rate" | "status"
 
 const OPTIONS_DEFAULTS = {
   /** master switch for all coloring (persisted; toggled via /colored-tabs) */
   enabled: true,
+  sidebar: { branch: true, tokens: true, rate: true, status: true },
   /** accent scale step used to anchor the palette */
   accentStep: "500",
   /** colored line on the left edge of vertical tab rows */
@@ -162,11 +166,19 @@ export default Plugin.define({
     const options = { ...OPTIONS_DEFAULTS, ...(context.options ?? {}) }
     await loadRgbClass()
 
-    // ---- master switch (persisted; toggled via /colored-tabs) ----
+    // ---- master switch and utility display settings (persisted) ----
+    const sidebarDefaults = {
+      ...OPTIONS_DEFAULTS.sidebar,
+      ...((options as AnyObj).sidebar ?? {}),
+    }
     const [settings, updateSettings] = context.storage.store("settings-v1", {
-      initial: { enabled: options.enabled !== false },
+      initial: {
+        enabled: options.enabled !== false,
+        sidebar: sidebarDefaults,
+      },
     })
     const isEnabled = (): boolean => settings.enabled !== false
+    const isSidebarFieldEnabled = (field: SidebarField): boolean => (settings as AnyObj).sidebar?.[field] !== false
 
     // ---- session -> palette index assignment (durable, rotates at 10) ----
     const [assign, updateAssign] = context.storage.store("assign-v2", {
@@ -214,6 +226,91 @@ export default Plugin.define({
     // ---- utility-sidebar data ----
     const vcsSyncRequested = new Set<string>()
     const messageSyncRequested = new Set<string>()
+    interface LiveStepRate {
+      sessionID: string
+      modelKey: string
+      startedAt: number
+      streamedAt?: number
+      outputChars: number
+      lastPublishedAt: number
+    }
+    interface ResponseRate {
+      modelKey: string
+      value: number
+      estimated: boolean
+    }
+    const liveSteps = new Map<string, LiveStepRate>()
+    const responseRates = new Map<string, ResponseRate>()
+    const [rateRevision, setRateRevision] = createSignal(0)
+    const modelKey = (model: AnyObj | undefined): string =>
+      model ? `${String(model.providerID ?? "")}/${String(model.id ?? model.modelID ?? "")}` : ""
+
+    const stopRateEvents = [
+      context.data.on("session.step.started", (event) => {
+        const data = event.data as AnyObj
+        const assistantMessageID = String(data.assistantMessageID ?? "")
+        if (!assistantMessageID) return
+        liveSteps.set(assistantMessageID, {
+          sessionID: String(data.sessionID),
+          modelKey: modelKey(data.model),
+          startedAt: Number(data.started ?? event.created),
+          outputChars: 0,
+          lastPublishedAt: 0,
+        })
+        if (responseRates.get(String(data.sessionID))?.modelKey === modelKey(data.model)) {
+          responseRates.delete(String(data.sessionID))
+        }
+        setRateRevision((revision) => revision + 1)
+      }),
+      context.data.on("session.step.streamed", (event) => {
+        const assistantMessageID = String(event.data.assistantMessageID ?? "")
+        const step = liveSteps.get(assistantMessageID)
+        if (step && step.streamedAt === undefined) step.streamedAt = Number(event.created)
+      }),
+    ]
+
+    const updateLiveRate = (event: AnyObj): void => {
+      const data = event.data as AnyObj
+      const step = liveSteps.get(String(data.assistantMessageID ?? ""))
+      if (!step || step.sessionID !== String(data.sessionID)) return
+      if (step.streamedAt === undefined) step.streamedAt = Number(event.created)
+      step.outputChars += String(data.delta ?? "").length
+      const now = Date.now()
+      const elapsedSeconds = (now - (step.streamedAt ?? step.startedAt)) / 1_000
+      if (step.outputChars <= 0 || elapsedSeconds <= 0) return
+      // Bound redraws during high-frequency deltas while keeping the rate live.
+      if (now - step.lastPublishedAt < 100) return
+      step.lastPublishedAt = now
+      responseRates.set(step.sessionID, {
+        modelKey: step.modelKey,
+        value: step.outputChars / 4 / elapsedSeconds,
+        estimated: true,
+      })
+      setRateRevision((revision) => revision + 1)
+    }
+
+    stopRateEvents.push(
+      context.data.on("session.text.delta", updateLiveRate),
+      context.data.on("session.reasoning.delta", updateLiveRate),
+      context.data.on("session.step.ended", (event) => {
+        const data = event.data as AnyObj
+        const assistantMessageID = String(data.assistantMessageID ?? "")
+        const step = liveSteps.get(assistantMessageID)
+        if (!step || step.sessionID !== String(data.sessionID)) return
+        liveSteps.delete(assistantMessageID)
+        const tokens = data.tokens as AnyObj | undefined
+        const output = Number(tokens?.output ?? 0) + Number(tokens?.reasoning ?? 0)
+        const elapsedSeconds = (Number(event.created) - (step.streamedAt ?? step.startedAt)) / 1_000
+        if (output > 0 && Number.isFinite(elapsedSeconds) && elapsedSeconds > 0) {
+          responseRates.set(step.sessionID, {
+            modelKey: step.modelKey,
+            value: output / elapsedSeconds,
+            estimated: false,
+          })
+        }
+        setRateRevision((revision) => revision + 1)
+      }),
+    )
 
     function tokenTotal(usage: AnyObj | undefined): number | undefined {
       if (!usage) return undefined
@@ -223,7 +320,7 @@ export default Plugin.define({
       return values.reduce((sum, value) => sum + (typeof value === "number" && Number.isFinite(value) ? value : 0), 0)
     }
 
-    function latestOutputTps(messages: readonly AnyObj[], modelRef?: AnyObj): number | undefined {
+    function latestHistoricalRate(messages: readonly AnyObj[], modelRef?: AnyObj): ResponseRate | undefined {
       for (let i = messages.length - 1; i >= 0; i--) {
         const message = messages[i]
         if (message?.type !== "assistant" || !message.tokens) continue
@@ -232,14 +329,26 @@ export default Plugin.define({
           modelRef && messageModel &&
           (messageModel.id !== modelRef.id || messageModel.providerID !== modelRef.providerID)
         ) continue
-        const output = Number(message.tokens.output ?? 0)
-        const started = Number(message.time?.streamed ?? message.time?.created)
+        const output = Number(message.tokens.output ?? 0) + Number(message.tokens.reasoning ?? 0)
+        const started = Number(message.time?.created)
         const completed = Number(message.time?.completed)
         if (!Number.isFinite(output) || output <= 0 || !Number.isFinite(started) || !Number.isFinite(completed)) continue
         const seconds = (completed - started) / 1000
-        if (seconds > 0) return output / seconds
+        if (seconds > 0) return { modelKey: modelKey(message.model), value: output / seconds, estimated: true }
       }
       return undefined
+    }
+
+    function readOutputRate(sessionID: string, ref?: AnyObj): ResponseRate | undefined {
+      rateRevision() // make the sidebar accessor reactive to streaming deltas/events
+      const key = modelKey(ref)
+      const active = [...liveSteps.values()].find((step) => step.sessionID === sessionID && (!key || step.modelKey === key))
+      const latest = responseRates.get(sessionID)
+      if (active) return latest?.modelKey === active.modelKey ? latest : undefined
+      if (latest && (!key || latest.modelKey === key)) return latest
+      const messages = context.data.session.message.list(sessionID) ?? []
+      const fallback = latestHistoricalRate(messages as AnyObj[], ref)
+      return fallback && (!key || fallback.modelKey === key) ? fallback : undefined
     }
 
     function locationForSession(sessionID: string): AnyObj | undefined {
@@ -968,37 +1077,57 @@ export default Plugin.define({
       } catch {}
     }
 
-    // ---- plugin-owned settings dialog: available while the effect is off ----
+    // ---- plugin-owned utility settings dialog; field toggles are persistent ----
     const openSettings = async (): Promise<void> => {
-      const current = isEnabled() ? "enabled" : "disabled"
-      const choice = await context.ui.dialog.select<"enabled" | "disabled">({
-        title: "Colored Tabs Settings",
-        current,
-        options: [
+      type SettingChoice = "tabs" | SidebarField
+      while (true) {
+        const optionsList = [
           {
-            title: "Enabled",
-            value: "enabled",
-            description: "Color tabs and sync the prompt to the active tab.",
+            title: `${isEnabled() ? "✓" : "○"} Colored tab identity + prompt sync`,
+            value: "tabs" as const,
+            description: "Color tab borders, titles, and the active prompt.",
           },
-          {
-            title: "Disabled",
-            value: "disabled",
-            description: "Restore OpenCode's default tab and prompt styling.",
-          },
-        ],
-      })
-      if (choice === undefined) return
+          ...([
+            ["branch", "Git branch"],
+            ["tokens", "Total tokens"],
+            ["rate", "Output rate"],
+            ["status", "Session status"],
+          ] as const).map(([field, label]) => ({
+            title: `${isSidebarFieldEnabled(field) ? "✓" : "○"} ${label}`,
+            value: field,
+            description: `${isSidebarFieldEnabled(field) ? "Hide" : "Show"} ${label.toLowerCase()} in the session sidebar.`,
+          })),
+        ]
+        const choice = await context.ui.dialog.select<SettingChoice>({
+          title: "OpenCode Utilities Settings",
+          placeholder: "Select an item to toggle · Esc to close",
+          current: "tabs",
+          options: optionsList,
+        })
+        if (choice === undefined) return
 
-      const next = choice === "enabled"
-      if (next === isEnabled()) return
-      settings.enabled = next // immediate local effect
-      await updateSettings((draft) => {
-        draft.enabled = next
-      })
-      lastRun = 0 // the next frame must apply/restore the setting immediately
-      try {
-        context.renderer.requestRender()
-      } catch {}
+        if (choice === "tabs") {
+          const next = !isEnabled()
+          settings.enabled = next
+          await updateSettings((draft) => {
+            draft.enabled = next
+          })
+          lastRun = 0
+        } else {
+          const next = !isSidebarFieldEnabled(choice)
+          const liveSettings = settings as AnyObj
+          liveSettings.sidebar ??= { ...sidebarDefaults }
+          liveSettings.sidebar[choice] = next
+          await updateSettings((draft) => {
+            const mutable = draft as AnyObj
+            mutable.sidebar ??= { ...sidebarDefaults }
+            mutable.sidebar[choice] = next
+          })
+        }
+        try {
+          context.renderer.requestRender()
+        } catch {}
+      }
     }
 
     let removeKeymapLayer: (() => void) | null = null
@@ -1011,10 +1140,10 @@ export default Plugin.define({
           commands: [
             {
               id: "red.colored-tabs.settings",
-              title: "Colored Tabs Settings",
-              group: "Colored Tabs",
+              title: "OpenCode Utilities Settings",
+              group: "Utilities",
               palette: true,
-              slash: { name: "colored-tabs" },
+              slash: { name: "utilities", aliases: ["colored-tabs"] },
               run: openSettings,
             },
           ],
@@ -1061,36 +1190,9 @@ export default Plugin.define({
           return selected ? { id: selected.modelID, providerID: selected.providerID } : undefined
         }
 
-        const modelName = (): string | undefined => {
-          const ref = modelRef()
-          if (!ref?.id) return undefined
-          const modelInfo = currentLocation()
-            ? context.data.location.model.list(currentLocation() as any)?.find(
-                (model: any) => model.providerID === ref.providerID && model.modelID === ref.id,
-              )
-            : undefined
-          return modelInfo?.name ?? String(ref.id)
-        }
-
-        const outputTps = (): number | undefined => {
-          const ref = modelRef()
-          const messages = context.data.session.message.list(sessionID) ?? []
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const message = messages[i] as AnyObj
-            if (message.type !== "assistant") continue
-            if (
-              ref && message.model &&
-              (message.model.id !== ref.id || message.model.providerID !== ref.providerID)
-            ) continue
-            const output = Number(message.tokens?.output ?? 0) + Number(message.tokens?.reasoning ?? 0)
-            const started = Number(message.time?.created)
-            const firstToken = Number(message.time?.streamed)
-            const elapsedSeconds = (firstToken - started) / 1_000
-            if (!Number.isFinite(output) || output <= 0 || !Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0) continue
-            return output / elapsedSeconds
-          }
-          return undefined
-        }
+        const readRate = () => readOutputRate(sessionID, modelRef())
+        const outputTps = () => readRate()?.value
+        const outputTpsEstimated = () => readRate()?.estimated
 
         const theme = () => {
           const colors = context.theme as AnyObj
@@ -1107,10 +1209,16 @@ export default Plugin.define({
             const here = currentLocation()
             return here ? context.data.location.vcs.info(here as any)?.branch.current : undefined
           },
-          model: modelName,
           totalTokens: () => tokenTotal(currentSession()?.tokens as AnyObj | undefined),
           outputTps,
+          outputTpsEstimated,
           status: () => context.data.session.status(sessionID),
+          visibleRows: () => ({
+            branch: isSidebarFieldEnabled("branch"),
+            tokens: isSidebarFieldEnabled("tokens"),
+            rate: isSidebarFieldEnabled("rate"),
+            status: isSidebarFieldEnabled("status"),
+          }),
           accent: () => isEnabled() ? rgbToHex(colorFor(sessionID)) : undefined,
           theme,
         } satisfies SidebarOverviewProps)
@@ -1131,6 +1239,13 @@ export default Plugin.define({
       try {
         removeSidebarSlot()
       } catch {}
+      for (const stop of stopRateEvents) {
+        try {
+          stop()
+        } catch {}
+      }
+      liveSteps.clear()
+      responseRates.clear()
       // Restore pre-plugin styles from the snapshots BEFORE clearing them, so
       // a plugin disable/reload cannot strand colored borders/text behind.
       // restoreOriginalState() also clears the snapshots, the row bindings,

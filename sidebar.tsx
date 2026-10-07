@@ -17,8 +17,16 @@
  *  - Fixed 6-char label column so values align into a scannable table.
  *  - Rows with no data disappear; with no data at all the whole section
  *    disappears, so the slot never renders an empty shell.
+ *  - The heading folds like the official sidebar sections: `▼ Session` open,
+ *    `▶ Session` collapsed, open on mount. The whole heading row toggles on
+ *    mouse press — the same event the official sections use — and answers
+ *    Enter/Space while focused, the only keyboard channel OpenTUI gives a
+ *    box. Pressing it never steals focus from the prompt.
+ *  - `visibleRows` lets the parent hide individual rows from persisted
+ *    settings: absent or true keeps a row, an explicit false hides it.
  *  - Motion: a single slow blink (900 ms) on the running dot. Nothing else
- *    moves — the terminal already repaints often enough.
+ *    moves — the terminal already repaints often enough. The dot rests
+ *    while the section is folded.
  *
  * Values may be passed plain or as Solid accessors, so the parent can wire
  * signals later without changing this component.
@@ -51,18 +59,21 @@ export interface SidebarOverviewTheme {
 
 /** A prop value: plain data now, or an accessor returning it later. */
 export type SidebarValue<T> = T | Accessor<T>
+export type SidebarOverviewRow = "branch" | "tokens" | "rate" | "status"
 
 export interface SidebarOverviewProps {
   /** Git branch, e.g. "main". Hidden when absent. */
   branch?: SidebarValue<string | null | undefined>
-  /** Current model, e.g. "anthropic/claude-opus-4-6". Hidden when absent. */
-  model?: SidebarValue<string | null | undefined>
   /** Total session tokens. 0 renders as "0" (fresh session); null hides the row. */
   totalTokens?: SidebarValue<number | null | undefined>
   /** Output tokens/sec. Hidden when absent or <= 0 (a 0 rate is noise). */
   outputTps?: SidebarValue<number | null | undefined>
+  /** Marks an in-progress character-based rate as approximate. */
+  outputTpsEstimated?: SidebarValue<boolean | undefined>
   /** Running sessions blink their dot; idle ones sit still and mute. */
   status?: SidebarValue<SidebarOverviewStatus | null | undefined>
+  /** Per-row visibility. An omitted row defaults to visible. */
+  visibleRows?: SidebarValue<Partial<Record<SidebarOverviewRow, boolean>>>
   /** Active tab identity color (hex from colors.ts). Falls back to theme primary. */
   accent?: SidebarValue<SidebarColor | null | undefined>
   /** Host theme colors (pass ctx.theme.current). Falls back to neutral grays. */
@@ -124,9 +135,20 @@ function clampLabel(text: string): string {
 // Building blocks
 // ---------------------------------------------------------------------------
 
-function Heading(props: { bar: SidebarColor; color: SidebarColor }): JSX.Element {
+function Heading(props: { bar: SidebarColor; color: SidebarColor; expanded: boolean; toggle: () => void }): JSX.Element {
+  const onKeyDown = (event: any) => {
+    const key = String(event?.name ?? event?.key ?? "").toLowerCase()
+    if (key === "enter" || key === "space" || key === " ") props.toggle()
+  }
   return (
-    <box flexDirection="row" gap={1}>
+    <box
+      flexDirection="row"
+      gap={1}
+      focusable
+      onMouseDown={() => props.toggle()}
+      onKeyDown={onKeyDown}
+    >
+      <text fg={props.color}>{props.expanded ? "▼" : "▶"}</text>
       <text flexShrink={0} fg={props.bar}>
         {BAR}
       </text>
@@ -155,12 +177,9 @@ function Row(props: { label: string; labelColor: SidebarColor; valueColor: Sideb
 // ---------------------------------------------------------------------------
 
 export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null {
+  const [expanded, setExpanded] = createSignal(true)
   const branch = () => {
     const raw = read(props.branch)
-    return typeof raw === "string" && raw.trim() ? clampLabel(raw.trim()) : null
-  }
-  const model = () => {
-    const raw = read(props.model)
     return typeof raw === "string" && raw.trim() ? clampLabel(raw.trim()) : null
   }
   const tokens = () => {
@@ -171,10 +190,16 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
     const raw = read(props.outputTps)
     return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? formatTps(raw) : null
   }
+  const rateValue = () => {
+    const raw = read(props.outputTps)
+    if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return null
+    return `${read(props.outputTpsEstimated) ? "~" : ""}${formatTps(raw)}`
+  }
   const status = () => {
     const raw = read(props.status)
     return raw === "running" || raw === "idle" ? raw : null
   }
+  const visible = (row: SidebarOverviewRow) => read(props.visibleRows)?.[row] !== false
 
   const colors = () => {
     const t = read(props.theme)
@@ -190,7 +215,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
   // The one moving part: the dot blinks only while running.
   const [blink, setBlink] = createSignal(false)
   createEffect(() => {
-    if (status() !== "running") {
+    if (!expanded() || status() !== "running") {
       setBlink(false)
       return
     }
@@ -205,47 +230,43 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
   const statusColor = () => (status() === "running" ? colors().success : colors().textMuted)
   const statusLabel = () => (status() === "running" ? "Running" : "Idle")
 
-  const hasAny = () => Boolean(branch() ?? model() ?? tokens() ?? tps() ?? status())
+  const hasAny = () => Boolean(branch() ?? tokens() ?? tps() ?? status())
+  const toggle = () => setExpanded((value) => !value)
 
   return (
     <Show when={hasAny()}>
       <box gap={1}>
-        <Heading bar={accent()} color={colors().text} />
-        <box>
-          <Show when={branch()}>
-            {(name) => (
-              <Row label="Branch" labelColor={colors().textMuted} valueColor={colors().text}>
-                {name()}
+        <Heading bar={accent()} color={colors().text} expanded={expanded()} toggle={toggle} />
+        <Show when={expanded()}>
+          <box>
+            <Show when={visible("branch") && branch()}>
+              {(name) => (
+                <Row label="Branch" labelColor={colors().textMuted} valueColor={colors().text}>
+                  {name()}
+                </Row>
+              )}
+            </Show>
+            <Show when={visible("tokens") && tokens()}>
+              {(count) => (
+                <Row label="Tokens" labelColor={colors().textMuted} valueColor={colors().text}>
+                  {count()}
+                </Row>
+              )}
+            </Show>
+            <Show when={visible("rate") && rateValue()}>
+              {(rate) => (
+                <Row label="Rate" labelColor={colors().textMuted} valueColor={colors().text}>
+                  {rate()}
+                </Row>
+              )}
+            </Show>
+            <Show when={visible("status") && status()}>
+              <Row label="Status" labelColor={colors().textMuted} valueColor={statusColor()}>
+                {dot()}{" "}{statusLabel()}
               </Row>
-            )}
-          </Show>
-          <Show when={model()}>
-            {(name) => (
-              <Row label="Model" labelColor={colors().textMuted} valueColor={colors().text}>
-                {name()}
-              </Row>
-            )}
-          </Show>
-          <Show when={tokens()}>
-            {(count) => (
-              <Row label="Tokens" labelColor={colors().textMuted} valueColor={colors().text}>
-                {count()}
-              </Row>
-            )}
-          </Show>
-          <Show when={tps()}>
-            {(rate) => (
-              <Row label="Rate" labelColor={colors().textMuted} valueColor={colors().text}>
-                {rate()}
-              </Row>
-            )}
-          </Show>
-          <Show when={status()}>
-            <Row label="Status" labelColor={colors().textMuted} valueColor={statusColor()}>
-              {dot()}{" "}{statusLabel()}
-            </Row>
-          </Show>
-        </box>
+            </Show>
+          </box>
+        </Show>
       </box>
     </Show>
   )

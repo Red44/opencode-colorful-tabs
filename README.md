@@ -18,9 +18,9 @@ bars visible even when long titles reach the edge.
   different. After 10 tabs the palette rotates. Colors are sticky per
   session (survive reordering and restarts) and persist across TUI
   instances.
-- **Vertical tab strip** (`tabs.layout: vertical`) — each tab row gets a
-  colored heavy `┃` line on its left and right edges, and the title text is
-  recolored to the same value.
+- **Vertical tab strip** (`tabs.layout: vertical`) — each tab row gets
+  colored heavy `┃` lines on both edges, and the title text is recolored to
+  the same value.
 - **Horizontal tab strip** (`tabs.layout: horizontal`) — each tab gets a
   colored underline instead.
 - **Prompt sync** — the main prompt window mirrors the ACTIVE tab: its
@@ -30,21 +30,20 @@ bars visible even when long titles reach the edge.
   tab strip.
 - Status indicators (busy/error dots) keep their own colors.
 - **Session overview** — adds a compact panel through OpenCode's supported
-  `sidebar.content` slot with the session Git branch, current model, cumulative
-  token total, output/reasoning tok/s for the current model, and running/idle
-  status. Tok/s is derived from the latest assistant message's token timing
-  (the API has no direct rate field); rows hide when the data is unavailable.
-  Branch is omitted for sessions whose location is not inside a Git repository.
+  `sidebar.content` slot with the session Git branch, cumulative token total,
+  live estimated and per-response output/reasoning tok/s, and running/idle
+  status. The model itself is omitted because OpenCode already shows it in the
+  prompt. Rows can be folded with the `▼` / `▶` heading and individually shown
+  or hidden in plugin settings. Branch is omitted outside a Git repo.
 
 ## Plugin settings
 
-Colored tabs are enabled by default. Open the command palette (`Ctrl+P`) and
-choose **Colored Tabs Settings**, or run `/colored-tabs`, to open the plugin's
-own settings dialog. Select **Enabled** or **Disabled**; the choice is
-persisted across TUI restarts. Turning it off restores the original tab,
-prompt, and agent-name colors. This is a plugin-owned dialog, not an entry in
-OpenCode's built-in **Open settings** menu (the plugin API has no settings
-registration hook).
+Colored tabs and the sidebar rows are enabled by default. Open the command
+palette (`Ctrl+P`) and choose **OpenCode Utilities Settings**, or run
+`/utilities` (also `/colored-tabs`). Select an item to toggle it; the dialog
+reopens with the updated state. Choices persist across TUI restarts. This is a
+plugin-owned settings dialog, not an entry in OpenCode's built-in **Open
+settings** menu (the plugin API has no settings registration hook).
 
 ## Install
 
@@ -65,6 +64,12 @@ change defaults:
       "package": "./plugins/colored-tabs",
       "options": {
         "enabled": true,       // initial state on first run; dialog choice persists
+        "sidebar": {           // which overview rows to show by default
+          "branch": true,
+          "tokens": true,
+          "rate": true,
+          "status": true
+        },
         "accentStep": "500",   // accent scale step anchoring the palette
         "dashLeft": true,      // left line on vertical tab rows
         "dashRight": true,     // right line on vertical tab rows
