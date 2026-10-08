@@ -541,6 +541,17 @@ export default Plugin.define({
       return values.reduce((sum, value) => sum + (typeof value === "number" && Number.isFinite(value) ? value : 0), 0)
     }
 
+    /** Share of session input tokens served from cache (0-100); undefined when unknown. */
+    function tokenCacheRate(usage: AnyObj | undefined): number | undefined {
+      if (!usage) return undefined
+      const cache = usage.cache ?? {}
+      const cached = Number(cache.read ?? 0)
+      const input = Number(usage.input ?? 0)
+      const denominator = input + cached + Number(cache.write ?? 0)
+      if (!Number.isFinite(denominator) || denominator <= 0 || cached <= 0) return undefined
+      return (cached / denominator) * 100
+    }
+
     function readOutputRate(sessionID: string): TurnRate | undefined {
       rateRevision() // make the sidebar accessor reactive to streaming deltas/events
       return turnRates.get(sessionID)
@@ -1610,6 +1621,7 @@ export default Plugin.define({
             textMuted: colors.text?.muted,
             primary: colors.text?.action?.primary?.base,
             success: colors.text?.feedback?.success?.base,
+            error: colors.text?.feedback?.error?.base,
           }
         }
 
@@ -1620,6 +1632,7 @@ export default Plugin.define({
             return here ? context.data.location.vcs.info(here as any)?.branch.current : undefined
           },
           totalTokens: () => tokenTotal(currentSession()?.tokens as AnyObj | undefined),
+          cacheRate: () => tokenCacheRate(currentSession()?.tokens as AnyObj | undefined),
           outputTps,
           outputTpsEstimated,
           ttfbMs: () => readOutputRate(sessionID)?.ttfbMs,

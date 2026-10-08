@@ -63,6 +63,7 @@ export interface SidebarOverviewTheme {
   textMuted?: SidebarColor
   primary?: SidebarColor
   success?: SidebarColor
+  error?: SidebarColor
 }
 
 /** A prop value: plain data now, or an accessor returning it later. */
@@ -74,6 +75,8 @@ export interface SidebarOverviewProps {
   branch?: SidebarValue<string | null | undefined>
   /** Total session tokens. 0 renders as "0" (fresh session); null hides the row. */
   totalTokens?: SidebarValue<number | null | undefined>
+  /** Share of session input tokens served from cache, 0-100. Muted suffix when known. */
+  cacheRate?: SidebarValue<number | null | undefined>
   /** Output tokens/sec. Hidden when absent or <= 0 (a 0 rate is noise). */
   outputTps?: SidebarValue<number | null | undefined>
   /** Mean time to first streamed output of the last response, in ms. Shown beside the rate. */
@@ -117,6 +120,7 @@ const FALLBACK_THEME: Required<SidebarOverviewTheme> = {
   textMuted: "#8a8a8a",
   primary: "#9a9a9a",
   success: "#6a9955",
+  error: "#c0504d",
 }
 
 const HEX = /^#[0-9a-f]{3,8}$/i
@@ -279,13 +283,23 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
   }
   const rateValue = () => {
     const raw = read(props.outputTps)
-    if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return null
-    const rate = `${read(props.outputTpsEstimated) ? "~" : ""}${formatTps(raw)}`
+    return typeof raw === "number" && Number.isFinite(raw) && raw > 0
+      ? `${read(props.outputTpsEstimated) ? "~" : ""}${formatTps(raw)}`
+      : null
+  }
+  /** Small muted suffix, number first: ` · 4886ms ttfb`. */
+  const ttfbSuffix = () => {
     const ttfb = read(props.ttfbMs)
-    if (typeof ttfb === "number" && Number.isFinite(ttfb) && ttfb > 0) {
-      return `${rate} · TTFB ${Math.round(ttfb)}ms`
-    }
-    return rate
+    return typeof ttfb === "number" && Number.isFinite(ttfb) && ttfb > 0
+      ? ` · ${Math.round(ttfb)}ms ttfb`
+      : ""
+  }
+  /** Small muted suffix: ` · 87% cache`. */
+  const cacheSuffix = () => {
+    const rate = read(props.cacheRate)
+    return typeof rate === "number" && Number.isFinite(rate) && rate > 0
+      ? ` · ${Math.round(rate)}% cache`
+      : ""
   }
   const status = () => {
     const raw = read(props.status)
@@ -304,6 +318,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
       textMuted: safeColor(t?.textMuted, FALLBACK_THEME.textMuted),
       primary: safeColor(t?.primary, FALLBACK_THEME.primary),
       success: safeColor(t?.success, FALLBACK_THEME.success),
+      error: safeColor(t?.error, FALLBACK_THEME.error),
     }
   }
   const accent = () => safeColor(read(props.accent), colors().primary)
@@ -339,7 +354,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
               <Row
                 label="Branch"
                 labelColor={colors().textMuted}
-                valueColor={branch() ? colors().text : colors().textMuted}
+                valueColor={branch() ? colors().text : colors().error}
               >
                 {branch() ?? "no git"}
               </Row>
@@ -348,6 +363,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
               {(count) => (
                 <Row label="Tokens" labelColor={colors().textMuted} valueColor={colors().text}>
                   {count()}
+                  <span style={{ fg: colors().textMuted }}>{cacheSuffix()}</span>
                 </Row>
               )}
             </Show>
@@ -355,6 +371,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
               {(rate) => (
                 <Row label="Rate" labelColor={colors().textMuted} valueColor={colors().text}>
                   {rate()}
+                  <span style={{ fg: colors().textMuted }}>{ttfbSuffix()}</span>
                 </Row>
               )}
             </Show>
