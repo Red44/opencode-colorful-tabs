@@ -7,7 +7,8 @@
  *   1. imports the script module (ESM or CJS, see `exportedFunction`),
  *   2. calls the exported function with a frozen `{ sessionID, directory,
  *      event }` context,
- *   3. validates the `{ title, percentage, color? }` / null result,
+ *   3. validates the `{ title, percentage, color?, titleColor? }` / null
+ *      result,
  *   4. posts one serializable response back to the parent.
  *
  * Every failure — missing export, thrown error, invalid result shape — is
@@ -70,8 +71,8 @@ async function handle(request: WorkerRequest): Promise<WorkerResponse> {
     if (typeof result.percentage !== "number" || !Number.isFinite(result.percentage)) {
       throw new TypeError("bar percentage must be a finite number")
     }
-    // `color` is optional; null/undefined mean "no script color". Anything
-    // else must be an exact "#RRGGBB" hex string.
+    // `color` and `titleColor` are optional; null/undefined mean "no script
+    // color". Anything else must be an exact "#RRGGBB" hex string.
     let color: string | undefined
     if (result.color !== undefined && result.color !== null) {
       if (typeof result.color !== "string" || !HEX_COLOR_PATTERN.test(result.color)) {
@@ -79,10 +80,20 @@ async function handle(request: WorkerRequest): Promise<WorkerResponse> {
       }
       color = result.color
     }
-    return {
-      ok: true,
-      bar: color === undefined ? { title: result.title.trim(), percentage: result.percentage } : { title: result.title.trim(), percentage: result.percentage, color },
+    let titleColor: string | undefined
+    if (result.titleColor !== undefined && result.titleColor !== null) {
+      if (typeof result.titleColor !== "string" || !HEX_COLOR_PATTERN.test(result.titleColor)) {
+        throw new TypeError('optional bar titleColor must be a "#RRGGBB" hex string')
+      }
+      titleColor = result.titleColor
     }
+    const bar: { title: string; percentage: number; color?: string; titleColor?: string } = {
+      title: result.title.trim(),
+      percentage: result.percentage,
+    }
+    if (color !== undefined) bar.color = color
+    if (titleColor !== undefined) bar.titleColor = titleColor
+    return { ok: true, bar }
   } catch (error) {
     return { ok: false, message: failureMessage(error) }
   }

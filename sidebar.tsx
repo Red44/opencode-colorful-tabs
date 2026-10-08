@@ -287,18 +287,18 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
       ? `${read(props.outputTpsEstimated) ? "~" : ""}${formatTps(raw)}`
       : null
   }
-  /** Small muted suffix, number first: ` · 4886ms ttfb`. */
+  /** Small muted suffix, number first: ` 4886ms ttfb`. */
   const ttfbSuffix = () => {
     const ttfb = read(props.ttfbMs)
     return typeof ttfb === "number" && Number.isFinite(ttfb) && ttfb > 0
-      ? ` · ${Math.round(ttfb)}ms ttfb`
+      ? ` ${Math.round(ttfb)}ms ttfb`
       : ""
   }
-  /** Small muted suffix: ` · 87% cache`. */
+  /** Small muted suffix: ` 94% hr` (hit rate). */
   const cacheSuffix = () => {
     const rate = read(props.cacheRate)
     return typeof rate === "number" && Number.isFinite(rate) && rate > 0
-      ? ` · ${Math.round(rate)}% cache`
+      ? ` ${Math.round(rate)}% hr`
       : ""
   }
   const status = () => {
@@ -387,7 +387,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
                     <BarRow
                       title={bar.title}
                       percentage={bar.percentage}
-                      titleColor={safeColor(bar.color, colors().textMuted)}
+                      titleColor={safeColor(bar.titleColor ?? bar.color, colors().textMuted)}
                       fillColor={safeColor(bar.color, bar.percentage >= 100 ? colors().success : colors().primary)}
                       trackColor={colors().textMuted}
                       pctColor={colors().text}

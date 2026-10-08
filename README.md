@@ -31,7 +31,7 @@ bars visible even when long titles reach the edge.
 - Status indicators (busy/error dots) keep their own colors.
 - **Session overview** — adds a compact panel through OpenCode's supported
   `sidebar.content` slot with the session Git branch, cumulative token total
-  (compact `14.1K` / `2.5M` units) with cache hit rate, live estimated and
+  (compact `14.1K` / `2.5M` units) with hit rate (`94% hr`), live estimated and
   per-response output/reasoning tok/s with time to first output
   (`4886ms ttfb` suffix), and running/idle status, plus user-authored progress
   bars. The
@@ -65,21 +65,22 @@ every project you open; all discovered scripts in an enabled scope run.
 
 A script exports a default function or named `getProgress` function. It receives
 the current session and update event, and returns a title and percentage (or
-`null` to hide that bar). It may also return an optional `color` as an exact
+`null` to hide that bar). It may also return an optional `color` (bar fill;
+falls back to the title color) and/or `titleColor` (name only), each an exact
 `"#RRGGBB"` hex string:
 
 ```js
 export default async function getProgress({ sessionID, directory, event }) {
-  return { title: "Tests", percentage: 42, color: "#22c55e" }
+  return { title: "Tests", percentage: 42, color: "#22c55e", titleColor: "#a78bfa" }
 }
 ```
 
-The color is fully script-controlled: the script decides if and when to set it
+Colors are fully script-controlled: the script decides if and when to set them
 (for example red while tests fail, green once they pass). When `color` is
-omitted the bar keeps its default styling. Colors other than an exact
-`"#RRGGBB"` hex string (e.g. `#fff` or `red`) are rejected like any other
-invalid result: the run reports an error and the bar is hidden for that
-refresh.
+omitted the bar keeps its default styling; when `titleColor` is omitted the
+name uses `color`. Colors other than an exact `"#RRGGBB"` hex string (e.g.
+`#fff` or `red`) are rejected like any other invalid result: the run reports
+an error and the bar is hidden for that refresh.
 
 Scripts refresh on `session.step.started`, `session.step.streamed`, text and
 reasoning deltas, `session.step.ended`, and `session.idle`; rapid updates are

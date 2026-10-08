@@ -4,8 +4,8 @@
  * Scripts live directly in the global or project `.opencode/bars` directory.
  * Each `.js` module exports either a default function or a named
  * `getProgress(context)` function and returns `{ title, percentage }`
- * (plus an optional script-controlled `color` as a `"#RRGGBB"` hex string)
- * or `null` to hide its bar.
+ * (plus optional script-controlled `color`/`titleColor` as `"#RRGGBB"` hex
+ * strings) or `null` to hide its bar.
  *
  * Every invocation runs inside its own short-lived Web Worker
  * (see ./bar-script-worker.ts), which lets a stuck script be terminated on
@@ -26,6 +26,8 @@ export interface ProgressBar {
   percentage: number
   /** Script-provided accent color as `"#RRGGBB"`; absent when not returned. */
   color?: string
+  /** Script-provided name color as `"#RRGGBB"`; absent when not returned. */
+  titleColor?: string
   scope: BarScope
 }
 
@@ -52,7 +54,7 @@ interface WorkerRequest {
 
 /** Serializable reply from a bar script worker. */
 type WorkerResponse =
-  | { ok: true; bar: { title: string; percentage: number; color?: string } | null }
+  | { ok: true; bar: { title: string; percentage: number; color?: string; titleColor?: string } | null }
   | { ok: false; message: string }
 
 interface ScriptFile {
@@ -184,6 +186,7 @@ function runWorkerScript(
             title: bar.title,
             percentage: clampPercentage(bar.percentage),
             ...(bar.color !== undefined ? { color: bar.color } : {}),
+            ...(bar.titleColor !== undefined ? { titleColor: bar.titleColor } : {}),
             scope: file.scope,
           }),
         )
