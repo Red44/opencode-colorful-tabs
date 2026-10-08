@@ -388,7 +388,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
                     <BarRow
                       title={bar.title}
                       percentage={bar.percentage}
-                      titleColor={safeColor(bar.titleColor ?? bar.color, colors().textMuted)}
+                      titleColor={safeColor(bar.titleColor, colors().textMuted)}
                       fillColor={safeColor(bar.color, bar.percentage >= 100 ? colors().success : colors().primary)}
                       trackColor={colors().textMuted}
                       pctColor={colors().text}

@@ -65,9 +65,8 @@ every project you open; all discovered scripts in an enabled scope run.
 
 A script exports a default function or named `getProgress` function. It receives
 the current session and update event, and returns a title and percentage (or
-`null` to hide that bar). It may also return an optional `color` (bar fill;
-falls back to the title color) and/or `titleColor` (name only), each an exact
-`"#RRGGBB"` hex string:
+`null` to hide that bar). It may also return an optional `color` (bar fill)
+and/or `titleColor` (name only), each an exact `"#RRGGBB"` hex string:
 
 ```js
 export default async function getProgress({ sessionID, directory, event }) {
@@ -76,11 +75,12 @@ export default async function getProgress({ sessionID, directory, event }) {
 ```
 
 Colors are fully script-controlled: the script decides if and when to set them
-(for example red while tests fail, green once they pass). When `color` is
-omitted the bar keeps its default styling; when `titleColor` is omitted the
-name uses `color`. Colors other than an exact `"#RRGGBB"` hex string (e.g.
-`#fff` or `red`) are rejected like any other invalid result: the run reports
-an error and the bar is hidden for that refresh.
+(for example red while tests fail, green once they pass). `color` tints only
+the bar; `titleColor` tints only the name. When omitted, the fill falls back to
+the theme (success color at 100%) and the name stays muted. Colors other than
+an exact `"#RRGGBB"` hex string (e.g. `#fff` or `red`) are rejected like any
+other invalid result: the run reports an error and the bar is hidden for that
+refresh.
 
 Scripts refresh on `session.step.started`, `session.step.streamed`, text and
 reasoning deltas, `session.step.ended`, and `session.idle`; rapid updates are
