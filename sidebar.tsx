@@ -141,6 +141,23 @@ function thousands(n: number): string {
   return String(Math.trunc(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",")
 }
 
+/** 999 -> "999", 14107 -> "14.1K", 2500000 -> "2.5M" — compact token units. */
+function compactTokens(n: number): string {
+  const units = ["", "K", "M", "G", "T"]
+  let unit = 0
+  let value = n
+  while (value >= 1_000 && unit < units.length - 1) {
+    value /= 1_000
+    unit++
+  }
+  let shown = unit === 0 ? Math.trunc(value) : Math.round(value * 10) / 10
+  if (shown >= 1_000 && unit < units.length - 1) {
+    unit++
+    shown = Math.round((shown / 1_000) * 10) / 10
+  }
+  return `${shown}${units[unit]}`
+}
+
 /** 47 -> "47 t/s", 6.53 -> "6.5 t/s", 1234 -> "1,234 t/s". */
 function formatTps(n: number): string {
   const v = n >= 100 ? Math.round(n) : Math.round(n * 10) / 10
@@ -254,7 +271,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
   }
   const tokens = () => {
     const raw = read(props.totalTokens)
-    return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? thousands(raw) : null
+    return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? compactTokens(raw) : null
   }
   const tps = () => {
     const raw = read(props.outputTps)
@@ -266,7 +283,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
     const rate = `${read(props.outputTpsEstimated) ? "~" : ""}${formatTps(raw)}`
     const ttfb = read(props.ttfbMs)
     if (typeof ttfb === "number" && Number.isFinite(ttfb) && ttfb > 0) {
-      return `${rate} · TTFB ${ttfb < 1_000 ? `${Math.round(ttfb)}ms` : `${(ttfb / 1_000).toFixed(1)}s`}`
+      return `${rate} · TTFB ${Math.round(ttfb)}ms`
     }
     return rate
   }
@@ -309,7 +326,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
   const statusColor = () => (status() === "running" ? colors().success : colors().textMuted)
   const statusLabel = () => (status() === "running" ? "Running" : "Idle")
 
-  const hasAny = () => Boolean(branch() ?? tokens() ?? tps() ?? status() ?? (bars().length > 0))
+  const hasAny = () => visible("branch") || Boolean(tokens() ?? tps() ?? status() ?? (bars().length > 0))
   const toggle = () => setExpanded((value) => !value)
 
   return (
@@ -318,12 +335,14 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
         <Heading color={colors().text} expanded={expanded()} toggle={toggle} />
         <Show when={expanded()}>
           <box>
-            <Show when={visible("branch") && branch()}>
-              {(name) => (
-                <Row label="Branch" labelColor={colors().textMuted} valueColor={colors().text}>
-                  {name()}
-                </Row>
-              )}
+            <Show when={visible("branch")}>
+              <Row
+                label="Branch"
+                labelColor={colors().textMuted}
+                valueColor={branch() ? colors().text : colors().textMuted}
+              >
+                {branch() ?? "no git"}
+              </Row>
             </Show>
             <Show when={visible("tokens") && tokens()}>
               {(count) => (

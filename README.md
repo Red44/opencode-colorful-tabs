@@ -30,13 +30,14 @@ bars visible even when long titles reach the edge.
   tab strip.
 - Status indicators (busy/error dots) keep their own colors.
 - **Session overview** — adds a compact panel through OpenCode's supported
-  `sidebar.content` slot with the session Git branch, cumulative token total,
-  live estimated and per-response output/reasoning tok/s with time to first
-  output (TTFB), and running/idle status, plus user-authored progress bars. The
+  `sidebar.content` slot with the session Git branch, cumulative token total
+  (compact `14.1K` / `2.5M` units), live estimated and per-response
+  output/reasoning tok/s with time to first output (`TTFB` in ms), and
+  running/idle status, plus user-authored progress bars. The
   model itself is omitted because
   OpenCode already shows it in the prompt. Rows can be folded with the `▼` / `▶`
-  heading and individually shown or hidden in plugin settings. Branch is
-  omitted outside a Git repo.
+  heading and individually shown or hidden in plugin settings. Outside a Git
+  repo the Branch row reads `no git`.
 
 ## Plugin settings
 
