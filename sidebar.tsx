@@ -287,12 +287,13 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
       ? `${read(props.outputTpsEstimated) ? "~" : ""}${formatTps(raw)}`
       : null
   }
-  /** Small muted suffix, number first: ` 4886ms ttfb`. */
+  /** Small muted suffix, number first: ` 488ms ttfb` or ` 1.2s ttfb`. */
   const ttfbSuffix = () => {
     const ttfb = read(props.ttfbMs)
-    return typeof ttfb === "number" && Number.isFinite(ttfb) && ttfb > 0
-      ? ` ${Math.round(ttfb)}ms ttfb`
-      : ""
+    if (!(typeof ttfb === "number" && Number.isFinite(ttfb) && ttfb > 0)) return ""
+    const value =
+      ttfb < 1_000 ? `${Math.round(ttfb)}ms` : `${(Math.round(ttfb / 100) / 10).toFixed(1)}s`
+    return ` ${value} ttfb`
   }
   /** Small muted suffix: ` 94% hr` (hit rate). */
   const cacheSuffix = () => {
