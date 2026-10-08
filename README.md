@@ -31,10 +31,12 @@ bars visible even when long titles reach the edge.
 - Status indicators (busy/error dots) keep their own colors.
 - **Session overview** — adds a compact panel through OpenCode's supported
   `sidebar.content` slot with the session Git branch, cumulative token total,
-  live estimated and per-response output/reasoning tok/s, and running/idle
-  status. The model itself is omitted because OpenCode already shows it in the
-  prompt. Rows can be folded with the `▼` / `▶` heading and individually shown
-  or hidden in plugin settings. Branch is omitted outside a Git repo.
+  live estimated and per-response output/reasoning tok/s with time to first
+  output (TTFB), and running/idle status, plus user-authored progress bars. The
+  model itself is omitted because
+  OpenCode already shows it in the prompt. Rows can be folded with the `▼` / `▶`
+  heading and individually shown or hidden in plugin settings. Branch is
+  omitted outside a Git repo.
 
 ## Plugin settings
 
@@ -45,6 +47,43 @@ to toggle it in place; the dialog stays open until Esc. Choices persist across
 TUI restarts. This is a plugin-owned settings dialog, not an entry in OpenCode's
 built-in **Open settings** menu (the plugin API has no settings registration
 hook).
+
+## Progress bar scripts
+
+Add `.js` files directly to either directory:
+
+- Global: `$OPENCODE_CONFIG_DIR/bars/` when set; otherwise
+  `$XDG_CONFIG_HOME/opencode/bars/` (defaults to `~/.config/opencode/bars/`)
+- Project-local: `<project>/.opencode/bars/`
+
+Global bars appear before project-local bars; files within each directory are
+ordered by filename. Both scopes are enabled by default and can be toggled
+independently in **OpenCode Utilities Settings**. The project toggle applies to
+every project you open; all discovered scripts in an enabled scope run.
+
+A script exports a default function or named `getProgress` function. It receives
+the current session and update event, and returns a title and percentage (or
+`null` to hide that bar). It may also return an optional `color` as an exact
+`"#RRGGBB"` hex string:
+
+```js
+export default async function getProgress({ sessionID, directory, event }) {
+  return { title: "Tests", percentage: 42, color: "#22c55e" }
+}
+```
+
+The color is fully script-controlled: the script decides if and when to set it
+(for example red while tests fail, green once they pass). When `color` is
+omitted the bar keeps its default styling. Colors other than an exact
+`"#RRGGBB"` hex string (e.g. `#fff` or `red`) are rejected like any other
+invalid result: the run reports an error and the bar is hidden for that
+refresh.
+
+Scripts refresh on `session.step.started`, `session.step.streamed`, text and
+reasoning deltas, `session.step.ended`, and `session.idle`; rapid updates are
+debounced. They execute as JavaScript in OpenCode's process, not in a sandbox;
+only add scripts you trust. Each script has a two-second timeout; a timed-out
+script is skipped until its file changes.
 
 ## Install
 
@@ -86,6 +125,8 @@ change defaults:
 ## Files
 
 - `tui.ts` — TUI plugin: tab styling, prompt sync, utility data and slots
+- `bar-scripts.ts` — discovers and evaluates global/project progress scripts
+- `bar-script-worker.ts` — per-invocation worker that loads and validates a script
 - `sidebar.tsx` — compact session overview panel
 - `colors.ts` — OKLCH palette engine (zero dependencies)
 

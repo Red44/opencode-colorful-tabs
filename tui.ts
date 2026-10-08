@@ -21,32 +21,36 @@
  *      dash and the agent name in the prompt footer ("Orchestrator …")
  *      are recolored to the active tab's color — the prompt itself tells
  *      you which tab you are in without reading the tab strip.
- *   4. The supported sidebar.content slot shows Git branch, model, token
- *      usage, output rate, and session status for the current session.
+ *   4. The supported sidebar.content slot shows session metadata and
+ *      event-driven progress bars supplied by trusted user scripts.
  */
 import { Plugin } from "@opencode/plugin/tui"
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { createComponent, createSignal } from "solid-js"
 import { createStore } from "solid-js/store"
 import { buildPalette, jitterFor, rgbToHex, hexToRgb, type Rgb } from "./colors"
+import { runBarScripts, type BarScope, type ProgressBar } from "./bar-scripts"
 import { SidebarOverview, type SidebarOverviewProps } from "./sidebar"
 import { UtilitiesSettingsDialog, type DialogField } from "./settings-dialog"
 
 type AnyObj = Record<string, any>
 type SidebarField = "branch" | "tokens" | "rate" | "status"
+type BarSettingField = "bars-global" | "bars-project"
 
+const GLOBAL_CONFIG_DIRECTORY =
+  process.env.OPENCODE_CONFIG_DIR ??
+  path.join(process.env.XDG_CONFIG_HOME ?? path.join(homedir(), ".config"), "opencode")
 /** Plugin-owned settings file: TUI storage.store is not durable in 2.0.23. */
-const SETTINGS_FILE = path.join(
-  homedir(),
-  ".config/opencode/plugins/colored-tabs/settings.json",
-)
+const SETTINGS_FILE = path.join(GLOBAL_CONFIG_DIRECTORY, "plugins", "colored-tabs", "settings.json")
+const SETTINGS_LOCK_FILE = `${SETTINGS_FILE}.lock`
 
 interface PersistedState {
   enabled?: boolean
   sidebar?: Record<string, boolean>
-  assign?: { next: number; bySession: Record<string, number> }
+  bars?: { global?: boolean; project?: boolean }
+  assign?: { next?: number; bySession?: Record<string, number> }
 }
 
 function loadPersistedState(): PersistedState {
@@ -58,16 +62,76 @@ function loadPersistedState(): PersistedState {
   }
 }
 
+function mergePersistedState(base: PersistedState, patch: PersistedState): PersistedState {
+  const merged: PersistedState = { ...base, ...patch }
+  if (base.sidebar || patch.sidebar) merged.sidebar = { ...base.sidebar, ...patch.sidebar }
+  if (base.bars || patch.bars) merged.bars = { ...base.bars, ...patch.bars }
+  if (base.assign || patch.assign) {
+    merged.assign = {
+      ...base.assign,
+      ...patch.assign,
+      bySession: { ...base.assign?.bySession, ...patch.assign?.bySession },
+    }
+  }
+  return merged
+}
+
 let saveTimer: ReturnType<typeof setTimeout> | null = null
-function persistStateSoon(getState: () => AnyObj): void {
-  if (saveTimer) return // coalesce bursts
-  saveTimer = setTimeout(() => {
-    saveTimer = null
+let pendingPersistedPatch: PersistedState = {}
+let savingPersistedState = false
+
+function flushPersistedState(): void {
+  saveTimer = null
+  if (savingPersistedState || Object.keys(pendingPersistedPatch).length === 0) return
+  savingPersistedState = true
+
+  let lock: number
+  try {
+    mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true })
+    lock = openSync(SETTINGS_LOCK_FILE, "wx")
+  } catch (error) {
+    const code = (error as { code?: string })?.code
+    if (code === "EEXIST") {
+      try {
+        if (Date.now() - statSync(SETTINGS_LOCK_FILE).mtimeMs > 5_000) unlinkSync(SETTINGS_LOCK_FILE)
+      } catch {}
+    }
+    savingPersistedState = false
+    saveTimer = setTimeout(flushPersistedState, code === "EEXIST" ? 40 : 1_000)
+    return
+  }
+
+  const patch = pendingPersistedPatch
+  pendingPersistedPatch = {}
+  const temporaryFile = `${SETTINGS_FILE}.${process.pid}.tmp`
+  try {
+    const state = mergePersistedState(loadPersistedState(), patch)
+    writeFileSync(temporaryFile, JSON.stringify(state, null, 2))
+    renameSync(temporaryFile, SETTINGS_FILE)
+  } catch {
     try {
-      mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true })
-      writeFileSync(SETTINGS_FILE, JSON.stringify(getState(), null, 2))
+      unlinkSync(temporaryFile)
     } catch {}
-  }, 150)
+    pendingPersistedPatch = mergePersistedState(patch, pendingPersistedPatch)
+  } finally {
+    try {
+      closeSync(lock)
+    } catch {}
+    try {
+      unlinkSync(SETTINGS_LOCK_FILE)
+    } catch {}
+    savingPersistedState = false
+  }
+
+  if (Object.keys(pendingPersistedPatch).length > 0 && !saveTimer) {
+    saveTimer = setTimeout(flushPersistedState, 150)
+  }
+}
+
+function persistStateSoon(getPatch: () => PersistedState): void {
+  pendingPersistedPatch = mergePersistedState(pendingPersistedPatch, getPatch())
+  if (saveTimer || savingPersistedState) return
+  saveTimer = setTimeout(flushPersistedState, 150)
 }
 
 const OPTIONS_DEFAULTS = {
@@ -90,7 +154,8 @@ const OPTIONS_DEFAULTS = {
 
 const DEBUG_FILE = `/tmp/opencode/colored-tab-plugin/plugin-debug-${process.pid}.log`
 function debug(enable: boolean, ...args: unknown[]): void {
-  if (!enable) return
+  // COLORED_TABS_DEBUG=1 turns on diagnostics without touching plugin options.
+  if (!enable && process.env.COLORED_TABS_DEBUG !== "1") return
   try {
     appendFileSync(
       DEBUG_FILE,
@@ -215,12 +280,18 @@ export default Plugin.define({
     const [settings, setSettings] = createStore<{
       enabled: boolean
       sidebar: Record<SidebarField, boolean>
+      bars: Record<BarScope, boolean>
     }>({
       enabled: persisted.enabled !== false,
       sidebar: { ...sidebarDefaults, ...(persisted.sidebar ?? {}) },
+      bars: {
+        global: persisted.bars?.global !== false,
+        project: persisted.bars?.project !== false,
+      },
     })
     const isEnabled = (): boolean => settings.enabled !== false
     const isSidebarFieldEnabled = (field: SidebarField): boolean => settings.sidebar?.[field] !== false
+    const isBarScopeEnabled = (scope: BarScope): boolean => settings.bars?.[scope] !== false
 
     // ---- session -> palette index assignment (rotates at 10) ----
     const [assign, setAssign] = createStore<{
@@ -230,6 +301,41 @@ export default Plugin.define({
       next: persisted.assign?.next ?? 0,
       bySession: persisted.assign?.bySession ?? {},
     })
+    let settingsSyncTimer: ReturnType<typeof setTimeout> | null = null
+    let settingsWatcher: ReturnType<typeof watch> | null = null
+    const syncPersistedState = (): void => {
+      const latest = loadPersistedState()
+      const barsChanged =
+        settings.bars.global !== (latest.bars?.global !== false) ||
+        settings.bars.project !== (latest.bars?.project !== false)
+      setSettings("enabled", latest.enabled !== false)
+      setSettings("sidebar", {
+        branch: latest.sidebar?.branch ?? sidebarDefaults.branch,
+        tokens: latest.sidebar?.tokens ?? sidebarDefaults.tokens,
+        rate: latest.sidebar?.rate ?? sidebarDefaults.rate,
+        status: latest.sidebar?.status ?? sidebarDefaults.status,
+      })
+      setSettings("bars", {
+        global: latest.bars?.global !== false,
+        project: latest.bars?.project !== false,
+      })
+      if (latest.assign) {
+        setAssign("next", latest.assign.next ?? 0)
+        setAssign("bySession", latest.assign.bySession ?? {})
+      }
+      if (barsChanged) refreshActiveBars()
+    }
+    try {
+      mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true })
+      settingsWatcher = watch(path.dirname(SETTINGS_FILE), (_event, filename) => {
+        if (filename && String(filename) !== path.basename(SETTINGS_FILE)) return
+        if (settingsSyncTimer) clearTimeout(settingsSyncTimer)
+        settingsSyncTimer = setTimeout(() => {
+          settingsSyncTimer = null
+          syncPersistedState()
+        }, 60)
+      })
+    } catch {}
     const colorCache = new Map<string, Rgb>()
     let palette: { hex: string; anchor: ReturnType<typeof buildPalette>[number]["anchor"] }[] = []
     let paletteAccentHex: string | null = null
@@ -258,17 +364,18 @@ export default Plugin.define({
     }
 
     function assignSession(sessionID: string): void {
-      if (assign.bySession[sessionID] !== undefined) return
+      const persistedAssign = loadPersistedState().assign
+      const existing = assign.bySession[sessionID] ?? persistedAssign?.bySession?.[sessionID]
+      if (existing !== undefined) {
+        if (assign.bySession[sessionID] === undefined) setAssign("bySession", sessionID, existing)
+        return
+      }
       ensurePalette()
-      const idx = assign.next % palette.length
-      setAssign("bySession", sessionID, assign.next % 10)
-      setAssign("next", (assign.next + 1) % 1_000_000)
-      if (assign.bySession[sessionID] === undefined) assign.bySession[sessionID] = idx
-      persistStateSoon(() => ({
-        enabled: settings.enabled,
-        sidebar: { ...settings.sidebar },
-        assign: { next: assign.next, bySession: { ...assign.bySession } },
-      }))
+      const next = Math.max(assign.next, persistedAssign?.next ?? 0)
+      const index = next % palette.length
+      setAssign("bySession", sessionID, index)
+      setAssign("next", next + 1)
+      persistStateSoon(() => ({ assign: { next: next + 1, bySession: { [sessionID]: index } } }))
     }
 
     // ---- utility-sidebar data ----
@@ -292,19 +399,25 @@ export default Plugin.define({
     interface TurnRate {
       value: number
       exact: boolean
+      /** Mean per-step time to first streamed output, when known. */
+      ttfbMs?: number
     }
     interface TurnAccumulator {
       output: number
       durationMs: number
+      ttfbMs: number
+      ttfbSteps: number
     }
     const activeSteps = new Map<string, ActiveStep>() // assistantMessageID -> step
     const turnAccumulators = new Map<string, TurnAccumulator>() // sessionID -> aggregate
     const turnRates = new Map<string, TurnRate>() // sessionID -> displayed rate
     const [rateRevision, setRateRevision] = createSignal(0)
+    const [vcsRevision, setVcsRevision] = createSignal(0)
 
     const stopRateEvents = [
       context.data.on("session.step.started", (event) => {
         const data = event.data as AnyObj
+        debug(true, "rate:step.started", String(data?.sessionID), String(data?.assistantMessageID))
         const assistantMessageID = String(data.assistantMessageID ?? "")
         if (!assistantMessageID) return
         activeSteps.set(assistantMessageID, {
@@ -355,27 +468,70 @@ export default Plugin.define({
         const data = event.data as AnyObj
         const assistantMessageID = String(data.assistantMessageID ?? "")
         const step = activeSteps.get(assistantMessageID)
+        debug(
+          true,
+          "rate:step.ended",
+          String(data?.sessionID),
+          assistantMessageID,
+          "stepFound",
+          step !== undefined,
+          "streamedAt",
+          step?.streamedAt,
+          "eventCreated",
+          event.created,
+          "output",
+          Number((data.tokens as AnyObj | undefined)?.output ?? 0),
+        )
         if (!step || step.sessionID !== String(data.sessionID)) return
         activeSteps.delete(assistantMessageID)
         if (step.streamedAt === undefined) return // no visible streaming this step
 
-        const streamedMs = Math.max(0, Number(event.created) - step.streamedAt)
+        const streamedMs = Math.max(0, Number(event.created) - step.startedAt)
+        // started→ended is this step's real generation window. Providers that
+        // deliver the whole step in one burst make streamed→ended collapse to
+        // a few ms, which starved the rate row forever (diagnosed 2026-10-08).
+        // TTFB is the step's started→first-streamed-output wait (server clock).
+        const ttfbMs = Math.max(0, step.streamedAt - step.startedAt)
         const tokens = data.tokens as AnyObj | undefined
         const output = Number(tokens?.output ?? 0) + Number(tokens?.reasoning ?? 0)
-        const accumulator = turnAccumulators.get(step.sessionID) ?? { output: 0, durationMs: 0 }
+        const accumulator = turnAccumulators.get(step.sessionID) ?? { output: 0, durationMs: 0, ttfbMs: 0, ttfbSteps: 0 }
         accumulator.output += output
         accumulator.durationMs += streamedMs
+        accumulator.ttfbMs += ttfbMs
+        accumulator.ttfbSteps += 1
         turnAccumulators.set(step.sessionID, accumulator)
 
         // Ignore micro-steps (<300 ms streamed): their timing is noise.
         if (accumulator.durationMs < 300 || accumulator.output <= 0) return
         const rate = accumulator.output / (accumulator.durationMs / 1_000)
         if (Number.isFinite(rate) && rate > 0 && rate <= 400) {
-          turnRates.set(step.sessionID, { value: rate, exact: true })
+          turnRates.set(step.sessionID, {
+            value: rate,
+            exact: true,
+            ttfbMs: accumulator.ttfbSteps > 0 ? Math.round(accumulator.ttfbMs / accumulator.ttfbSteps) : undefined,
+          })
         }
         setRateRevision((revision) => revision + 1)
       }),
     )
+
+    // Diagnostics: with COLORED_TABS_DEBUG=1, log every server event type so
+    // rate/step handler wiring can be checked against real event names.
+    if (process.env.COLORED_TABS_DEBUG === "1") {
+      try {
+        const stopTap = (context.data as AnyObj).listen?.((payload: unknown) => {
+          const details = (payload as AnyObj)?.details ?? payload
+          const type = String(details?.type ?? "unknown")
+          if (/^session\.step\./.test(type)) {
+            debug(true, "tap-full", type, JSON.stringify(payload).slice(0, 600))
+          } else if (/delta|message|session\./.test(type)) {
+            const data = (details?.properties ?? details?.data ?? details) as AnyObj
+            debug(true, "event", type, Object.keys(data ?? {}))
+          }
+        })
+        if (typeof stopTap === "function") stopRateEvents.push(stopTap)
+      } catch {}
+    }
 
     function tokenTotal(usage: AnyObj | undefined): number | undefined {
       if (!usage) return undefined
@@ -393,6 +549,128 @@ export default Plugin.define({
     function locationForSession(sessionID: string): AnyObj | undefined {
       return context.data.session.get(sessionID)?.location ?? context.location ?? undefined
     }
+
+    interface BarRefreshState {
+      timer?: ReturnType<typeof setTimeout>
+      queuedAt?: number
+      running: boolean
+      dirty: boolean
+      event: string
+      controller?: AbortController
+    }
+    const barsBySession = new Map<string, ProgressBar[]>()
+    const barRefreshes = new Map<string, BarRefreshState>()
+    const [barRevision, setBarRevision] = createSignal(0)
+    let activeSidebarSessionID: string | undefined
+    let disposed = false
+
+    const runBarRefresh = async (sessionID: string, state: BarRefreshState): Promise<void> => {
+      if (disposed) return
+      state.timer = undefined
+      state.queuedAt = undefined
+      if (state.running) {
+        state.dirty = true
+        return
+      }
+
+      state.running = true
+      state.dirty = false
+      const controller = new AbortController()
+      state.controller = controller
+      const eventName = state.event
+      const location = locationForSession(sessionID)
+      const directory = typeof location?.directory === "string" ? location.directory : undefined
+      try {
+        const bars = await runBarScripts({
+          globalDirectory: isBarScopeEnabled("global") ? path.join(GLOBAL_CONFIG_DIRECTORY, "bars") : undefined,
+          projectDirectory:
+            isBarScopeEnabled("project") && directory
+              ? path.join(directory, ".opencode", "bars")
+              : undefined,
+          context: { sessionID, directory, event: eventName },
+          timeoutMs: 2_000,
+          signal: controller.signal,
+          onError: (file, error) => debug(options.debug, "bar script failed", file, error),
+        })
+        if (!disposed && !controller.signal.aborted && activeSidebarSessionID === sessionID) {
+          barsBySession.set(sessionID, bars)
+          setBarRevision((value) => value + 1)
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) debug(options.debug, "bar refresh failed", sessionID, error)
+      } finally {
+        state.running = false
+        state.controller = undefined
+        if (
+          !disposed &&
+          state.dirty &&
+          activeSidebarSessionID === sessionID &&
+          barRefreshes.get(sessionID) === state
+        ) {
+          state.dirty = false
+          scheduleBarRefresh(sessionID, state.event)
+        }
+      }
+    }
+
+    const scheduleBarRefresh = (sessionID: string, eventName: string): void => {
+      if (disposed || !sessionID || activeSidebarSessionID !== sessionID) return
+      let state = barRefreshes.get(sessionID)
+      if (!state) {
+        state = { running: false, dirty: false, event: eventName }
+        barRefreshes.set(sessionID, state)
+      }
+      state.event = eventName
+      if (state.running) {
+        state.dirty = true
+        return
+      }
+      const now = Date.now()
+      state.queuedAt ??= now
+      if (state.timer) clearTimeout(state.timer)
+      const maxWaitMs = 1_000
+      const delay = Math.max(0, Math.min(300, state.queuedAt + maxWaitMs - now))
+      state.timer = setTimeout(() => void runBarRefresh(sessionID, state), delay)
+    }
+
+    const discardBarSession = (sessionID: string): void => {
+      const state = barRefreshes.get(sessionID)
+      if (state?.timer) clearTimeout(state.timer)
+      state?.controller?.abort()
+      barRefreshes.delete(sessionID)
+      if (barsBySession.delete(sessionID)) setBarRevision((value) => value + 1)
+    }
+
+    const activateSidebarSession = (sessionID: string | undefined): void => {
+      if (activeSidebarSessionID === sessionID) return
+      if (activeSidebarSessionID) discardBarSession(activeSidebarSessionID)
+      activeSidebarSessionID = sessionID
+      if (sessionID) scheduleBarRefresh(sessionID, "sidebar.open")
+    }
+
+    const readBars = (sessionID: string): ProgressBar[] => {
+      barRevision()
+      return (barsBySession.get(sessionID) ?? []).filter((bar) => isBarScopeEnabled(bar.scope))
+    }
+
+    const scheduleBarsForEvent = (eventName: string) => (event: unknown): void => {
+      const data = (event as { data?: { sessionID?: unknown } } | null)?.data
+      const sessionID = String(data?.sessionID ?? "")
+      if (sessionID === activeSidebarSessionID) scheduleBarRefresh(sessionID, eventName)
+    }
+    const stopBarEvents = [
+      context.data.on("session.step.started", scheduleBarsForEvent("session.step.started")),
+      context.data.on("session.step.streamed", scheduleBarsForEvent("session.step.streamed")),
+      context.data.on("session.text.delta", scheduleBarsForEvent("session.text.delta")),
+      context.data.on("session.reasoning.delta", scheduleBarsForEvent("session.reasoning.delta")),
+      context.data.on("session.step.ended", scheduleBarsForEvent("session.step.ended")),
+      context.data.on("session.idle", scheduleBarsForEvent("session.idle")),
+      context.data.on("session.deleted", (event) => {
+        const sessionID = String((event.data as AnyObj).sessionID ?? "")
+        discardBarSession(sessionID)
+        if (activeSidebarSessionID === sessionID) activeSidebarSessionID = undefined
+      }),
+    ]
 
     // ---- one tree walk: tab rows + the marked composer textarea ----
     interface WalkResult {
@@ -1120,7 +1398,7 @@ export default Plugin.define({
     // A custom JSX dialog: rows toggle in place (Enter/Space/click) and the
     // dialog STAYS OPEN. The built-in select always closes on Enter, which
     // made real settings interaction impossible.
-    type UtilitySetting = "tabs" | SidebarField
+    type UtilitySetting = "tabs" | SidebarField | BarSettingField
     const utilityItems: Array<{ field: UtilitySetting; label: string; description: string }> = [
       {
         field: "tabs",
@@ -1147,18 +1425,48 @@ export default Plugin.define({
         label: "Session status",
         description: "Running/idle indicator in the sidebar.",
       },
+      {
+        field: "bars-global",
+        label: "Global bar scripts",
+        description: "Run scripts from the OpenCode config bars directory in every project.",
+      },
+      {
+        field: "bars-project",
+        label: "Project bar scripts",
+        description: "Run each opened project's .opencode/bars scripts.",
+      },
     ]
-    const isUtilityEnabled = (field: UtilitySetting): boolean =>
-      field === "tabs" ? isEnabled() : isSidebarFieldEnabled(field)
+    const isUtilityEnabled = (field: UtilitySetting): boolean => {
+      if (field === "tabs") return isEnabled()
+      if (field === "bars-global") return isBarScopeEnabled("global")
+      if (field === "bars-project") return isBarScopeEnabled("project")
+      return isSidebarFieldEnabled(field)
+    }
+    const refreshActiveBars = (): void => {
+      if (!activeSidebarSessionID) return
+      barRefreshes.get(activeSidebarSessionID)?.controller?.abort()
+      scheduleBarRefresh(activeSidebarSessionID, "settings.changed")
+    }
     const applyUtility = (field: UtilitySetting): void => {
       const next = !isUtilityEnabled(field)
+      let patch: PersistedState
       if (field === "tabs") {
         setSettings("enabled", next)
         lastRun = 0
+        patch = { enabled: next }
+      } else if (field === "bars-global") {
+        setSettings("bars", "global", next)
+        refreshActiveBars()
+        patch = { bars: { global: next } }
+      } else if (field === "bars-project") {
+        setSettings("bars", "project", next)
+        refreshActiveBars()
+        patch = { bars: { project: next } }
       } else {
         setSettings("sidebar", field as SidebarField, next)
+        patch = { sidebar: { [field]: next } }
       }
-      persistStateSoon(() => ({ enabled: settings.enabled, sidebar: { ...settings.sidebar }, assign: { ...assign } }))
+      persistStateSoon(() => patch)
       try {
         context.renderer.requestRender()
       } catch {}
@@ -1213,6 +1521,7 @@ export default Plugin.define({
             theme,
             highlightBg,
             highlight: dialogHighlight,
+            setHighlight: setDialogHighlight,
             rows: utilityItems.map((item) => ({
               field: item.field as DialogField,
               label: item.label,
@@ -1251,14 +1560,14 @@ export default Plugin.define({
       }
     } catch {}
 
-    // ---- utility sidebar: session branch, model, cumulative tokens, rate ----
+    // ---- utility sidebar: session metadata and script progress bars ----
     const syncedVcsDirectories = new Set<string>()
     const syncedMessageSessions = new Set<string>()
     const removeSidebarSlot = context.ui.slot({
       append: "sidebar.content",
       render: ({ sessionID }) => {
+        activateSidebarSession(sessionID)
         if (!sessionID) return null
-
         assignSession(sessionID)
         const currentSession = () => context.data.session.get(sessionID)
         const currentLocation = () => currentSession()?.location ?? context.location ?? undefined
@@ -1268,7 +1577,9 @@ export default Plugin.define({
         const vcs = location ? context.data.location.vcs.info(location as any) : undefined
         if (directory && !vcs?.branch?.current && !syncedVcsDirectories.has(directory)) {
           syncedVcsDirectories.add(directory)
-          void context.data.location.vcs.sync(location as any).catch(() => {
+          void context.data.location.vcs.sync(location as any).then(() => {
+            if (!disposed) setVcsRevision((revision) => revision + 1)
+          }).catch(() => {
             syncedVcsDirectories.delete(directory)
           })
         }
@@ -1304,18 +1615,22 @@ export default Plugin.define({
 
         return createComponent(SidebarOverview, {
           branch: () => {
+            vcsRevision() // VCS info is loaded asynchronously and is not directly reactive.
             const here = currentLocation()
             return here ? context.data.location.vcs.info(here as any)?.branch.current : undefined
           },
           totalTokens: () => tokenTotal(currentSession()?.tokens as AnyObj | undefined),
           outputTps,
           outputTpsEstimated,
+          ttfbMs: () => readOutputRate(sessionID)?.ttfbMs,
+          bars: () => readBars(sessionID),
           status: () => context.data.session.status(sessionID),
           visibleRows: () => ({
             branch: isSidebarFieldEnabled("branch"),
             tokens: isSidebarFieldEnabled("tokens"),
             rate: isSidebarFieldEnabled("rate"),
             status: isSidebarFieldEnabled("status"),
+            bars: isBarScopeEnabled("global") || isBarScopeEnabled("project"),
           }),
           accent: () => isEnabled() ? rgbToHex(colorFor(sessionID)) : undefined,
           theme,
@@ -1325,6 +1640,7 @@ export default Plugin.define({
 
     context.renderer.on("frame", onFrame)
     return () => {
+      disposed = true
       try {
         context.renderer.off("frame", onFrame)
       } catch {}
@@ -1335,8 +1651,28 @@ export default Plugin.define({
         if (removeKeymapLayer) removeKeymapLayer()
       } catch {}
       try {
+        removeDialogKeymap?.()
+      } catch {}
+      try {
         removeSidebarSlot()
       } catch {}
+      for (const stop of stopBarEvents) {
+        try {
+          stop()
+        } catch {}
+      }
+      for (const state of barRefreshes.values()) {
+        if (state.timer) clearTimeout(state.timer)
+        state.controller?.abort()
+      }
+      barRefreshes.clear()
+      barsBySession.clear()
+      activeSidebarSessionID = undefined
+      try {
+        settingsWatcher?.close()
+      } catch {}
+      if (settingsSyncTimer) clearTimeout(settingsSyncTimer)
+      setDialogOpen(false)
       for (const stop of stopRateEvents) {
         try {
           stop()

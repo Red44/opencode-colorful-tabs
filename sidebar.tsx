@@ -24,6 +24,13 @@
  *    box. Pressing it never steals focus from the prompt.
  *  - `visibleRows` lets the parent hide individual rows from persisted
  *    settings: absent or true keeps a row, an explicit false hides it.
+ *  - `bars` renders script progress meters as compact single-line rows:
+ *    truncated title, a thin solid-over-shade track, and the percentage,
+ *    all sharing one line. A meter's own `color` (validated hex from the
+ *    script) tints both its title and its filled segments; the theme
+ *    primary (success at 100%) remains the fallback. Percentages clamp
+ *    to 0–100, and the whole area vanishes when empty — while folding
+ *    with the section like every other line.
  *  - Motion: a single slow blink (900 ms) on the running dot. Nothing else
  *    moves — the terminal already repaints often enough. The dot rests
  *    while the section is folded.
@@ -33,8 +40,9 @@
  */
 
 /** @jsxImportSource @opentui/solid */
-import { createEffect, createSignal, onCleanup, Show, type Accessor } from "solid-js"
+import { createEffect, createSignal, For, onCleanup, Show, type Accessor } from "solid-js"
 import type { JSX } from "@opentui/solid"
+import type { ProgressBar } from "./bar-scripts"
 
 // ---------------------------------------------------------------------------
 // Public contract
@@ -59,7 +67,7 @@ export interface SidebarOverviewTheme {
 
 /** A prop value: plain data now, or an accessor returning it later. */
 export type SidebarValue<T> = T | Accessor<T>
-export type SidebarOverviewRow = "branch" | "tokens" | "rate" | "status"
+export type SidebarOverviewRow = "branch" | "tokens" | "rate" | "status" | "bars"
 
 export interface SidebarOverviewProps {
   /** Git branch, e.g. "main". Hidden when absent. */
@@ -68,8 +76,16 @@ export interface SidebarOverviewProps {
   totalTokens?: SidebarValue<number | null | undefined>
   /** Output tokens/sec. Hidden when absent or <= 0 (a 0 rate is noise). */
   outputTps?: SidebarValue<number | null | undefined>
+  /** Mean time to first streamed output of the last response, in ms. Shown beside the rate. */
+  ttfbMs?: SidebarValue<number | null | undefined>
   /** Marks an in-progress character-based rate as approximate. */
   outputTpsEstimated?: SidebarValue<boolean | undefined>
+  /**
+   * Progress meters from bar-scripts.ts, already ordered by the parent
+   * (global first, then project). Rendered in the received order; hidden
+   * when absent, empty, or switched off via visibleRows.bars.
+   */
+  bars?: SidebarValue<ProgressBar[] | null | undefined>
   /** Running sessions blink their dot; idle ones sit still and mute. */
   status?: SidebarValue<SidebarOverviewStatus | null | undefined>
   /** Per-row visibility. An omitted row defaults to visible. */
@@ -89,6 +105,11 @@ const LABEL_WIDTH = 6 // "Branch" / "Model" / "Tokens" / "Rate" / "Status"
 const LABEL_GAP = 2
 const MAX_VALUE_CHARS = 28 // 6 + 2 + 28 fits the 37-col slot with room to spare
 const BLINK_MS = 900
+const BAR_FILL = "▄" // meter fill — lower-half block keeps the strip thin
+const BAR_TRACK = "▄" // same glyph, muted: fill and track share one thin height
+const BAR_WIDTH = 12 // thin track leaves room for the inline title
+const BAR_PCT_CHARS = 4 // "100%" — fixed column keeps every track aligned
+const BAR_TITLE_CHARS = 37 - BAR_WIDTH - BAR_PCT_CHARS - 2 // title + track + pct on one 37-col line
 
 /** Neutral fallback — only used until the parent wires ctx.theme.current. */
 const FALLBACK_THEME: Required<SidebarOverviewTheme> = {
@@ -131,6 +152,35 @@ function clampLabel(text: string): string {
   return text.length <= MAX_VALUE_CHARS ? text : `${text.slice(0, MAX_VALUE_CHARS - 1)}…`
 }
 
+/** Inline meter titles get a tighter clamp so title + track + pct share one line. */
+function clampBarTitle(text: string): string {
+  return text.length <= BAR_TITLE_CHARS ? text : `${text.slice(0, BAR_TITLE_CHARS - 1)}…`
+}
+
+/** Clamp to 0–100, then carve the thin meter into solid + track segments. */
+function barSegments(percentage: number): { filled: string; track: string } {
+  const clamped = Math.min(100, Math.max(0, percentage))
+  const filledCount = Math.round((clamped / 100) * BAR_WIDTH)
+  return {
+    filled: BAR_FILL.repeat(filledCount),
+    track: BAR_TRACK.repeat(BAR_WIDTH - filledCount),
+  }
+}
+
+/** Structural guard: malformed meter entries are skipped, never rendered. */
+function toRenderableBars(raw: unknown): ProgressBar[] {
+  if (!Array.isArray(raw)) return []
+  const bars: ProgressBar[] = []
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue
+    const bar = item as Partial<ProgressBar>
+    if (typeof bar.title !== "string" || !bar.title.trim()) continue
+    if (typeof bar.percentage !== "number" || !Number.isFinite(bar.percentage)) continue
+    bars.push(item as ProgressBar)
+  }
+  return bars
+}
+
 // ---------------------------------------------------------------------------
 // Building blocks
 // ---------------------------------------------------------------------------
@@ -169,6 +219,29 @@ function Row(props: { label: string; labelColor: SidebarColor; valueColor: Sideb
   )
 }
 
+/** One meter: truncated title, thin solid-over-shade track, and pct — one line. */
+function BarRow(props: {
+  title: string
+  percentage: number
+  titleColor: SidebarColor
+  fillColor: SidebarColor
+  trackColor: SidebarColor
+  pctColor: SidebarColor
+}): JSX.Element {
+  const pct = `${Math.round(Math.min(100, Math.max(0, props.percentage)))}%`.padStart(BAR_PCT_CHARS)
+  const { filled, track } = barSegments(props.percentage)
+  return (
+    <box flexDirection="row" gap={1}>
+      <text flexShrink={1} flexGrow={1} fg={props.titleColor}>
+        {clampBarTitle(props.title)}
+      </text>
+      <text flexShrink={0} fg={props.fillColor}>{filled}</text>
+      <text flexShrink={0} fg={props.trackColor}>{track}</text>
+      <text flexShrink={0} fg={props.pctColor}>{pct}</text>
+    </box>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -190,11 +263,20 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
   const rateValue = () => {
     const raw = read(props.outputTps)
     if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return null
-    return `${read(props.outputTpsEstimated) ? "~" : ""}${formatTps(raw)}`
+    const rate = `${read(props.outputTpsEstimated) ? "~" : ""}${formatTps(raw)}`
+    const ttfb = read(props.ttfbMs)
+    if (typeof ttfb === "number" && Number.isFinite(ttfb) && ttfb > 0) {
+      return `${rate} · TTFB ${ttfb < 1_000 ? `${Math.round(ttfb)}ms` : `${(ttfb / 1_000).toFixed(1)}s`}`
+    }
+    return rate
   }
   const status = () => {
     const raw = read(props.status)
     return raw === "running" || raw === "idle" ? raw : null
+  }
+  const bars = () => {
+    if (read(props.visibleRows)?.bars === false) return []
+    return toRenderableBars(read(props.bars))
   }
   const visible = (row: SidebarOverviewRow) => read(props.visibleRows)?.[row] !== false
 
@@ -227,7 +309,7 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
   const statusColor = () => (status() === "running" ? colors().success : colors().textMuted)
   const statusLabel = () => (status() === "running" ? "Running" : "Idle")
 
-  const hasAny = () => Boolean(branch() ?? tokens() ?? tps() ?? status())
+  const hasAny = () => Boolean(branch() ?? tokens() ?? tps() ?? status() ?? (bars().length > 0))
   const toggle = () => setExpanded((value) => !value)
 
   return (
@@ -261,6 +343,22 @@ export function SidebarOverview(props: SidebarOverviewProps): JSX.Element | null
               <Row label="Status" labelColor={colors().textMuted} valueColor={statusColor()}>
                 {dot()}{" "}{statusLabel()}
               </Row>
+            </Show>
+            <Show when={bars().length > 0}>
+              <box marginTop={1}>
+                <For each={bars()}>
+                  {(bar) => (
+                    <BarRow
+                      title={bar.title}
+                      percentage={bar.percentage}
+                      titleColor={safeColor(bar.color, colors().textMuted)}
+                      fillColor={safeColor(bar.color, bar.percentage >= 100 ? colors().success : colors().primary)}
+                      trackColor={colors().textMuted}
+                      pctColor={colors().text}
+                    />
+                  )}
+                </For>
+              </box>
             </Show>
           </box>
         </Show>
