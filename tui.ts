@@ -38,6 +38,7 @@ import { UtilitiesSettingsDialog, type DialogField } from "./settings-dialog"
 type AnyObj = Record<string, any>
 type SidebarField = "branch" | "tokens" | "rate" | "status"
 type BarSettingField = "bars-global" | "bars-project"
+type UtilitySetting = "tabs" | SidebarField | BarSettingField | "mcp-injection"
 
 const GLOBAL_CONFIG_DIRECTORY =
   process.env.OPENCODE_CONFIG_DIR ??
@@ -50,6 +51,7 @@ interface PersistedState {
   enabled?: boolean
   sidebar?: Record<string, boolean>
   bars?: { global?: boolean; project?: boolean }
+  mcpInjection?: boolean
   assign?: { next?: number; bySession?: Record<string, number> }
 }
 
@@ -1472,11 +1474,17 @@ export default Plugin.define({
         label: "Project bar scripts",
         description: "Run each opened project's .opencode/bars scripts.",
       },
+      {
+        field: "mcp-injection",
+        label: "MCP session injection",
+        description: "Stamp session IDs into MCP tool calls (server side).",
+      },
     ]
     const isUtilityEnabled = (field: UtilitySetting): boolean => {
       if (field === "tabs") return isEnabled()
       if (field === "bars-global") return isBarScopeEnabled("global")
       if (field === "bars-project") return isBarScopeEnabled("project")
+      if (field === "mcp-injection") return loadPersistedState().mcpInjection === true
       return isSidebarFieldEnabled(field)
     }
     const refreshActiveBars = (): void => {
@@ -1499,6 +1507,8 @@ export default Plugin.define({
         setSettings("bars", "project", next)
         refreshActiveBars()
         patch = { bars: { project: next } }
+      } else if (field === "mcp-injection") {
+        patch = { mcpInjection: next }
       } else {
         setSettings("sidebar", field as SidebarField, next)
         patch = { sidebar: { [field]: next } }

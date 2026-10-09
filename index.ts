@@ -24,7 +24,7 @@
  * Loaded as a plain plugin object: importing the SDK package does not resolve
  * for local directory plugins on OpenCode 2.0.23.
  */
-import { appendFileSync, existsSync, readdirSync, readFileSync } from "node:fs"
+import { appendFileSync, existsSync, readdirSync, readFileSync, watch } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { Database } from "bun:sqlite"
@@ -58,14 +58,48 @@ const plugin = {
   id: "red.colored-tabs.server",
   async setup(ctx: AnyObj) {
     const options = (ctx.options ?? {}) as Options
-    debug(true, "mcp:setup", "injection", options.mcpSessionInjection === true)
-    if (options.mcpSessionInjection !== true) return
     const debugOn = options.debug === true
     const toolCtx = ctx.tool as AnyObj | undefined
     if (!toolCtx || typeof toolCtx.transform !== "function" || typeof toolCtx.hook !== "function") {
       debug(debugOn, "mcp:unavailable", "tool transform/hook APIs missing in this OpenCode version")
       return
     }
+
+    // Injection state: the Utilities dialog's persisted setting wins once
+    // set; otherwise the static plugin option applies. Default: off.
+    const settingsFile = path.join(
+      process.env.OPENCODE_CONFIG_DIR ?? path.join(process.env.XDG_CONFIG_HOME ?? path.join(homedir(), ".config"), "opencode"),
+      "plugins",
+      "colored-tabs",
+      "settings.json",
+    )
+    let injectionEnabled = options.mcpSessionInjection === true
+    const readPersisted = (): boolean | undefined => {
+      try {
+        const raw = JSON.parse(readFileSync(settingsFile, "utf8")) as AnyObj
+        if (typeof raw?.mcpInjection === "boolean") return raw.mcpInjection
+      } catch {}
+      return undefined
+    }
+    const persisted = readPersisted()
+    if (persisted !== undefined) injectionEnabled = persisted
+    // Follow dialog toggles live: on enable, replay transforms so schemas
+    // widen without a restart. Disabling stops stamping on the next call.
+    let settingsWatcher: ReturnType<typeof watch> | undefined
+    try {
+      settingsWatcher = watch(path.dirname(settingsFile), (_event, filename) => {
+        if (filename && String(filename) !== path.basename(settingsFile)) return
+        const next = readPersisted()
+        if (next === undefined || next === injectionEnabled) return
+        injectionEnabled = next
+        debug(debugOn, "mcp:injection toggled", injectionEnabled)
+        if (injectionEnabled && typeof toolCtx.reload === "function") {
+          void Promise.resolve(toolCtx.reload()).catch(() => {})
+        }
+      })
+    } catch {}
+    debug(debugOn, "mcp:setup", "injection", injectionEnabled)
+
 
     // MCP tool ids are `<server>_<tool>` (dots become `_`). Servers connect
     // asynchronously after setup, so the name cache refreshes periodically;
@@ -138,6 +172,7 @@ const plugin = {
     // 1. Widen every injected MCP tool's input schema so `opencode_session`
     //    validates. Transforms replay over MCP catalog refreshes.
     const transformRegistration = await toolCtx.transform((editor: AnyObj) => {
+      if (!injectionEnabled) return
       let widened = 0
       for (const tool of editor.list()) {
         if (!isEnabled(String(tool.id))) continue
@@ -155,13 +190,14 @@ const plugin = {
 
     // 2. Stamp the live session ID into every outgoing injected MCP call.
     const hookRegistration = await toolCtx.hook("execute.before", (event: AnyObj) => {
+      if (!injectionEnabled) return
       const toolID = String(event?.tool ?? "")
       if (!isEnabled(toolID)) return
       event.input = { ...(event.input ?? {}), opencode_session: event.sessionID }
       debug(debugOn, "mcp:injected", toolID, String(event?.sessionID ?? ""))
     })
 
-    debug(debugOn, "mcp:session-injection active", [...serverNames])
+    debug(debugOn, "mcp:session-injection", injectionEnabled ? "on" : "off", [...serverNames])
 
     // ---- agent-facing cross-session tools: opencode.session_search / .session_message ----
     const sessionCtx = ctx.session as AnyObj | undefined
@@ -344,6 +380,7 @@ const plugin = {
     })
 
     return () => {
+      settingsWatcher?.close()
       clearTimeout(serverRefreshTimer)
       for (const registration of [transformRegistration, hookRegistration, messagingRegistration]) {
         try {

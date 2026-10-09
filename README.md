@@ -128,11 +128,15 @@ change defaults:
 
 ### MCP session injection
 
-Off by default. When `mcpSessionInjection` is `true`, the plugin widens every
-MCP tool's input schema with an `opencode_session` string field and stamps the
-live session ID into each outgoing MCP call. MCP servers can use it to call
-back into the session through OpenCode's HTTP API (for example
-`POST /api/session/{id}/synthetic` for machine events).
+Off by default. When enabled, the plugin widens every MCP tool's input schema
+with an `opencode_session` string field and stamps the live session ID into
+each outgoing MCP call. MCP servers can use it to call back into the session
+through OpenCode's HTTP API (for example `POST /api/session/{id}/synthetic`
+for machine events).
+
+Enable it in **OpenCode Utilities Settings** ("MCP session injection" row —
+applies live, no restart) or set `mcpSessionInjection: true` in the plugin
+options. The dialog choice persists and overrides the static option.
 
 Restrict it to trusted servers with an allowlist of MCP server names:
 

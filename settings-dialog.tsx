@@ -25,6 +25,7 @@ export type DialogField =
   | "status"
   | "bars-global"
   | "bars-project"
+  | "mcp-injection"
 
 export interface SettingsDialogProps {
   theme: any
