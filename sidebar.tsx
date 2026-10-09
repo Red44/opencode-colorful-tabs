@@ -256,8 +256,13 @@ function BarRow(props: {
       <text flexShrink={1} flexGrow={1} fg={props.titleColor}>
         {clampBarTitle(props.title)}
       </text>
-      <text flexShrink={0} fg={props.fillColor}>{filled}</text>
-      <text flexShrink={0} fg={props.trackColor}>{track}</text>
+      {/* One text node with spans: total width never changes, so the fill
+          boundary repaints in place instead of leaving stale transparent
+          cells behind when the percentage moves. */}
+      <text flexShrink={0}>
+        <span style={{ fg: props.fillColor }}>{filled}</span>
+        <span style={{ fg: props.trackColor }}>{track}</span>
+      </text>
       <text flexShrink={0} fg={props.pctColor}>{pct}</text>
     </box>
   )
