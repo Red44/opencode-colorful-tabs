@@ -118,6 +118,7 @@ change defaults:
         "dashRight": true,     // right line on vertical tab rows
         "recolorTitle": true,  // title text matches the line color
         "promptSync": true,    // prompt dashes + agent name follow active tab
+        "mcpSessionInjection": false, // stamp session IDs into MCP tool calls (see below)
         "debug": false         // log matcher decisions to /tmp/opencode/...
       }
     }
@@ -125,9 +126,29 @@ change defaults:
 }
 ```
 
+### MCP session injection
+
+Off by default. When `mcpSessionInjection` is `true`, the plugin widens every
+MCP tool's input schema with an `opencode_session` string field and stamps the
+live session ID into each outgoing MCP call. MCP servers can use it to call
+back into the session through OpenCode's HTTP API (for example
+`POST /api/session/{id}/synthetic` for machine events).
+
+Restrict it to trusted servers with an allowlist of MCP server names:
+
+```jsonc
+{ "mcpSessionInjection": true, "mcpSessionInjectionServers": ["gh_grep", "exa"] }
+```
+
+Caveats: strictly validating MCP servers (`additionalProperties: false`)
+reject the extra field unless they declare it themselves — exclude them via
+the allowlist. Only inject into servers you trust: the session ID grants them
+write access to your session through the API.
+
 ## Files
 
 - `tui.ts` — TUI plugin: tab styling, prompt sync, utility data and slots
+- `index.ts` — server-side entry: opt-in MCP session injection
 - `bar-scripts.ts` — discovers and evaluates global/project progress scripts
 - `bar-script-worker.ts` — per-invocation worker that loads and validates a script
 - `sidebar.tsx` — compact session overview panel
