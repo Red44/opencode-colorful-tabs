@@ -145,6 +145,22 @@ reject the extra field unless they declare it themselves — exclude them via
 the allowlist. Only inject into servers you trust: the session ID grants them
 write access to your session through the API.
 
+### Cross-session tools
+
+Always registered (in the `opencode` namespace, Code Mode catalog):
+
+- `opencode_session_search` — fuzzy-search all local sessions by title,
+  directory, or session ID; returns `{id, title, directory, updated}` ranked,
+  newest first on ties.
+- `opencode_session_message` — deliver text to a session by ID: `kind:
+  "synthetic"` appends a machine message (no admission hooks), `kind: "prompt"`
+  submits a real prompt; optional `delivery: "steer" | "queue"` and `dryRun`
+  to validate without sending. Returns the admitted message ID.
+
+Any agent can therefore message any other session without shell scripts.
+Sessions are enumerated read-only from the local SQLite store (legacy JSON
+storage as fallback).
+
 ## Files
 
 - `tui.ts` — TUI plugin: tab styling, prompt sync, utility data and slots
