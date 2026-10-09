@@ -25,7 +25,7 @@
  *      event-driven progress bars supplied by trusted user scripts.
  */
 import { Plugin } from "@opencode/plugin/tui"
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from "node:fs"
+import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { createComponent, createSignal } from "solid-js"
@@ -267,6 +267,32 @@ export default Plugin.define({
   async setup(context) {
     const options = { ...OPTIONS_DEFAULTS, ...(context.options ?? {}) }
     await loadRgbClass()
+
+    // ---- ship bundled bar scripts + the bar-script authoring skill ----
+    // Installed into the user's global config only when the target is
+    // missing, so edits to already-installed scripts are never clobbered.
+    try {
+      const bundled = path.dirname(new URL(import.meta.url).pathname)
+      for (const [fromDir, toDir] of [
+        [path.join(bundled, "bars"), path.join(GLOBAL_CONFIG_DIRECTORY, "bars")],
+        [path.join(bundled, "skills", "bar-scripts"), path.join(GLOBAL_CONFIG_DIRECTORY, "skills", "bar-scripts")],
+      ] as const) {
+        let names: string[] = []
+        try {
+          names = readdirSync(fromDir)
+        } catch {
+          continue
+        }
+        for (const name of names) {
+          const to = path.join(toDir, name)
+          if (existsSync(to)) continue
+          try {
+            mkdirSync(toDir, { recursive: true })
+            copyFileSync(path.join(fromDir, name), to)
+          } catch {}
+        }
+      }
+    } catch {}
 
     // ---- master switch and utility display settings (persisted to a JSON
     // file next to the plugin: TUI plugin storage.store does not reliably
@@ -1561,7 +1587,7 @@ export default Plugin.define({
               title: "OpenCode Utilities Settings",
               group: "Utilities",
               palette: true,
-              slash: { name: "utilities", aliases: ["colored-tabs"] },
+              slash: { name: "utilities" },
               run: openSettings,
             },
           ],
