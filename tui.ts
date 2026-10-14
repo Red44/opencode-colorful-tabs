@@ -309,6 +309,7 @@ export default Plugin.define({
       enabled: boolean
       sidebar: Record<SidebarField, boolean>
       bars: Record<BarScope, boolean>
+      mcpInjection: boolean
     }>({
       enabled: persisted.enabled !== false,
       sidebar: { ...sidebarDefaults, ...(persisted.sidebar ?? {}) },
@@ -316,6 +317,7 @@ export default Plugin.define({
         global: persisted.bars?.global !== false,
         project: persisted.bars?.project !== false,
       },
+      mcpInjection: persisted.mcpInjection === true,
     })
     const isEnabled = (): boolean => settings.enabled !== false
     const isSidebarFieldEnabled = (field: SidebarField): boolean => settings.sidebar?.[field] !== false
@@ -347,6 +349,7 @@ export default Plugin.define({
         global: latest.bars?.global !== false,
         project: latest.bars?.project !== false,
       })
+      setSettings("mcpInjection", latest.mcpInjection === true)
       if (latest.assign) {
         setAssign("next", latest.assign.next ?? 0)
         setAssign("bySession", latest.assign.bySession ?? {})
@@ -1484,7 +1487,7 @@ export default Plugin.define({
       if (field === "tabs") return isEnabled()
       if (field === "bars-global") return isBarScopeEnabled("global")
       if (field === "bars-project") return isBarScopeEnabled("project")
-      if (field === "mcp-injection") return loadPersistedState().mcpInjection === true
+      if (field === "mcp-injection") return settings.mcpInjection === true
       return isSidebarFieldEnabled(field)
     }
     const refreshActiveBars = (): void => {
@@ -1508,6 +1511,7 @@ export default Plugin.define({
         refreshActiveBars()
         patch = { bars: { project: next } }
       } else if (field === "mcp-injection") {
+        setSettings("mcpInjection", next)
         patch = { mcpInjection: next }
       } else {
         setSettings("sidebar", field as SidebarField, next)
