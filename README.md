@@ -119,6 +119,7 @@ change defaults:
         "recolorTitle": true,  // title text matches the line color
         "promptSync": true,    // prompt dashes + agent name follow active tab
         "mcpSessionInjection": false, // stamp session IDs into MCP tool calls (see below)
+        "modelLimitsRefresh": true, // refresh model limits from models.dev at startup
         "debug": false         // log matcher decisions to /tmp/opencode/...
       }
     }
@@ -148,6 +149,28 @@ Caveats: strictly validating MCP servers (`additionalProperties: false`)
 reject the extra field unless they declare it themselves — exclude them via
 the allowlist. Only inject into servers you trust: the session ID grants them
 write access to your session through the API.
+
+### Model limits refresh
+
+On by default (`modelLimitsRefresh: false` disables). At every startup the
+server entry fetches the live [models.dev](https://models.dev) registry — the
+same authoritative source OpenCode consumes — and registers a model transform
+that corrects each model's `context`/`input`/`output` limits to current
+values. Transforms replay whenever the catalog is rebuilt, so corrected limits
+land before model selection or auto-compaction checks. This prevents
+premature compaction when the locally cached catalog lags the registry (for
+example gpt-6-luna shipped 400k/272k locally vs 1,050,000/922,000/128,000
+upstream). I checked the live Z.AI OpenAI-compatible
+`/api/coding/paas/v4/models` response (11 models): it returned model
+identifiers/ownership fields only, with no limit fields. OpenAI's documented
+`/v1/models` response likewise contains identifiers, creation time, ownership,
+and shutdown date — no context/input/output limits (a live OpenAI request
+wasn't possible with the expired local OAuth credential). So the registry is
+the authoritative fallback. Failed or malformed fetches
+fall back to the last-known registry snapshot cached under
+`~/.cache/opencode/colored-tabs-models-dev.json`; models the registry does not
+list and individual stats absent from partial entries keep their last-known
+catalog/cache values. No credentials are involved.
 
 ### Cross-session tools
 

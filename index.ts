@@ -24,7 +24,7 @@
  * Loaded as a plain plugin object: importing the SDK package does not resolve
  * for local directory plugins on OpenCode 2.0.23.
  */
-import { appendFileSync, existsSync, readdirSync, readFileSync, watch } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, watch, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { Database } from "bun:sqlite"
@@ -34,6 +34,7 @@ type AnyObj = Record<string, any>
 interface Options {
   mcpSessionInjection?: boolean
   mcpSessionInjectionServers?: string[]
+  modelLimitsRefresh?: boolean
   debug?: boolean
 }
 
@@ -54,15 +55,162 @@ function debug(enable: boolean, ...args: unknown[]): void {
   } catch {}
 }
 
+// ---- startup model-limits refresh (auto-compaction correctness) ----
+// The locally cached catalog can lag the live models.dev registry (e.g.
+// gpt-6-luna shipped 400k/272k locally vs 1,050,000/922,000/128,000
+// upstream), which makes auto-compaction fire against a stale input budget.
+// Provider APIs do not help: OpenAI's /v1/models returns ids only, no
+// limits. So on every startup we fetch the registry (the same authoritative
+// source OpenCode consumes), cache it for offline starts, and register a
+// model transform that corrects context/input/output. Model transforms
+// replay whenever the catalog is rebuilt — before model selection or
+// compaction checks.
+
+export interface ModelLimitSpec {
+  context?: number
+  input?: number
+  output?: number
+}
+
+/** Parse+validate a models.dev api.json payload into `provider/model` → limits. */
+export function parseModelLimits(raw: unknown): Map<string, ModelLimitSpec> {
+  const out = new Map<string, ModelLimitSpec>()
+  if (!raw || typeof raw !== "object") return out
+  for (const [providerID, provider] of Object.entries(raw as AnyObj)) {
+    const models = (provider as AnyObj)?.models
+    if (!models || typeof models !== "object") continue
+    for (const [modelID, model] of Object.entries(models as AnyObj)) {
+      const limit = (model as AnyObj)?.limit
+      if (!limit || typeof limit !== "object") continue
+      const contextRaw = Number(limit.context)
+      const inputRaw = Number(limit.input)
+      const outputRaw = Number(limit.output)
+      const spec: ModelLimitSpec = {}
+      if (Number.isFinite(contextRaw) && contextRaw > 0) spec.context = contextRaw
+      if (Number.isFinite(inputRaw) && inputRaw > 0 && (spec.context === undefined || inputRaw <= spec.context)) {
+        spec.input = inputRaw
+      }
+      if (Number.isFinite(outputRaw) && outputRaw > 0 && (spec.context === undefined || outputRaw <= spec.context)) {
+        spec.output = outputRaw
+      }
+      // Missing/invalid individual stats stay absent; the transform preserves
+      // the catalog's last-known value for those fields rather than deriving
+      // or zeroing them.
+      if (Object.keys(spec).length > 0) out.set(`${providerID}/${modelID}`, spec)
+    }
+  }
+  return out
+}
+
+/** Apply registry limits to a model editor; returns the number of models changed. */
+export function applyModelLimits(editor: AnyObj, limits: Map<string, ModelLimitSpec>): number {
+  let updated = 0
+  for (const model of editor.list() as AnyObj[]) {
+    const spec = limits.get(`${model.providerID}/${model.id}`)
+    if (!spec) continue
+    const current = (model.limit ?? {}) as AnyObj
+    const changed = (Object.keys(spec) as Array<keyof ModelLimitSpec>).some((key) => current[key] !== spec[key])
+    if (!changed) continue
+    editor.update(model.providerID, model.id, (m: AnyObj) => {
+      m.limit = { ...m.limit, ...spec }
+    })
+    updated++
+  }
+  return updated
+}
+
+function mergeModelLimits(
+  lastKnown: Map<string, ModelLimitSpec> | null,
+  live: Map<string, ModelLimitSpec>,
+): Map<string, ModelLimitSpec> {
+  const merged = new Map(lastKnown ?? [])
+  for (const [key, spec] of live) merged.set(key, { ...merged.get(key), ...spec })
+  return merged
+}
+
+function modelLimitsCacheFile(): string {
+  return path.join(process.env.XDG_CACHE_HOME ?? path.join(homedir(), ".cache"), "opencode", "colored-tabs-models-dev.json")
+}
+
+function writeModelLimitsCache(limits: Map<string, ModelLimitSpec>): void {
+  try {
+    const file = modelLimitsCacheFile()
+    mkdirSync(path.dirname(file), { recursive: true })
+    writeFileSync(file, JSON.stringify({ fetchedAt: Date.now(), limits: Object.fromEntries(limits) }, null, 2), { mode: 0o600 })
+  } catch {}
+}
+
+function readModelLimitsCache(): Map<string, ModelLimitSpec> | null {
+  try {
+    const raw = JSON.parse(readFileSync(modelLimitsCacheFile(), "utf8")) as AnyObj
+    const entries = raw?.limits
+    if (!entries || typeof entries !== "object") return null
+    const limits = new Map<string, ModelLimitSpec>()
+    for (const [key, value] of Object.entries(entries as AnyObj)) {
+      const spec = value as AnyObj
+      const parsed = parseModelLimits({ cache: { models: { model: { limit: spec } } } }).get("cache/model")
+      if (parsed) limits.set(key, parsed)
+    }
+    return limits
+  } catch {
+    return null
+  }
+}
+
+/** Fetch live registry limits; fall back to the last-known cache on failure. */
+export async function loadModelLimits(debugOn: boolean): Promise<Map<string, ModelLimitSpec> | null> {
+  try {
+    const response = await fetch("https://models.dev/api.json", {
+      signal: AbortSignal.timeout(5_000),
+      headers: { accept: "application/json" },
+    })
+    if (response.ok) {
+      const live = parseModelLimits(await response.json())
+      if (live.size > 0) {
+        const limits = mergeModelLimits(readModelLimitsCache(), live)
+        writeModelLimitsCache(limits)
+        debug(debugOn, "models:registry fetched", live.size, "models; merged", limits.size, "last-known")
+        return limits
+      }
+    }
+  } catch {
+    // network/timeout/malformed — fall through to the cache
+  }
+  const cached = readModelLimitsCache()
+  debug(debugOn, "models:registry fallback cache", cached?.size ?? 0, "models")
+  return cached && cached.size > 0 ? cached : null
+}
+
 const plugin = {
   id: "red.colored-tabs.server",
   async setup(ctx: AnyObj) {
     const options = (ctx.options ?? {}) as Options
     const debugOn = options.debug === true
+
+    // Model refresh belongs at the server startup layer, independently of
+    // the optional tool-transform/hook API. Keep it before that capability
+    // guard so model limits still refresh in hosts that omit tool APIs.
+    const modelCtx = ctx.model as AnyObj | undefined
+    let modelLimitsRegistration: AnyObj | undefined
+    if (options.modelLimitsRefresh !== false && modelCtx && typeof modelCtx.transform === "function") {
+      const limits = await loadModelLimits(debugOn)
+      if (limits) {
+        modelLimitsRegistration = await modelCtx.transform((editor: AnyObj) => {
+          const updated = applyModelLimits(editor, limits)
+          if (updated > 0) debug(debugOn, "models:limits refreshed", updated)
+          const luna = (editor.list() as AnyObj[]).find((m) => String(m.id) === "gpt-6-luna")
+          if (luna) debug(debugOn, "models:gpt-6-luna final limit", JSON.stringify(luna.limit))
+        })
+        debug(debugOn, "models:refresh active", limits.size, "models")
+      } else {
+        debug(debugOn, "models:refresh skipped", "no limits available")
+      }
+    }
+
     const toolCtx = ctx.tool as AnyObj | undefined
     if (!toolCtx || typeof toolCtx.transform !== "function" || typeof toolCtx.hook !== "function") {
       debug(debugOn, "mcp:unavailable", "tool transform/hook APIs missing in this OpenCode version")
-      return
+      return () => modelLimitsRegistration?.dispose?.()
     }
 
     // Injection state: the Utilities dialog's persisted setting wins once
@@ -99,7 +247,6 @@ const plugin = {
       })
     } catch {}
     debug(debugOn, "mcp:setup", "injection", injectionEnabled)
-
 
     // MCP tool ids are `<server>_<tool>` (dots become `_`). Servers connect
     // asynchronously after setup, so the name cache refreshes periodically;
@@ -382,7 +529,7 @@ const plugin = {
     return () => {
       settingsWatcher?.close()
       clearTimeout(serverRefreshTimer)
-      for (const registration of [transformRegistration, hookRegistration, messagingRegistration]) {
+      for (const registration of [transformRegistration, hookRegistration, messagingRegistration, modelLimitsRegistration]) {
         try {
           registration?.dispose?.()
         } catch {}
