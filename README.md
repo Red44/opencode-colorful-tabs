@@ -183,8 +183,16 @@ Always registered (in the `opencode` namespace, Code Mode catalog):
   "synthetic"` appends a machine message (no admission hooks), `kind: "prompt"`
   submits a real prompt; optional `delivery: "steer" | "queue"` and `dryRun`
   to validate without sending. Returns the admitted message ID.
+- `opencode_bg_shell` — start a shell command in the background: an alias of
+  OpenCode's built-in `shell` tool with `background: true` forced. The command
+  runs through the built-in executor, so OpenCode's normal shell permission
+  policy applies unchanged (approval prompt, workdir/file-access checks). The
+  call returns immediately with the job/shell identifier and the file the
+  output is streaming to; the harness captures output there and posts a
+  completion notice to the session when the command finishes.
 
-Any agent can therefore message any other session without shell scripts.
+Any agent can therefore message any other session — or start a
+permission-checked background command — without shell scripts.
 Sessions are enumerated read-only from the local SQLite store (legacy JSON
 storage as fallback).
 

@@ -128,6 +128,69 @@ function mergeModelLimits(
   return merged
 }
 
+/** Input/execute contract the alias needs from the built-in `shell` tool. */
+export type BgShellBuiltin = {
+  execute: (input: AnyObj, context: AnyObj) => Promise<AnyObj>
+}
+
+/**
+ * Build the `opencode_bg_shell` tool info from the built-in `shell` tool.
+ *
+ * Reuses the built-in executor verbatim (permission prompt, workdir checks,
+ * Job/Shell services, completion notification) with `background: true`
+ * forced. Returns `undefined` when the built-in executor is not exposed —
+ * the caller must then register nothing (fail closed; never spawn
+ * unsandboxed as a fallback).
+ */
+export function createBgShellAlias(builtin: BgShellBuiltin | undefined): AnyObj | undefined {
+  if (!builtin || typeof builtin.execute !== "function") return undefined
+  const runBuiltin = builtin.execute
+  return {
+    name: "bg_shell",
+    description:
+      "Run a shell command in the background and return immediately. Same permission-checked execution as the built-in shell tool, but always background: no timeout by default, useful for dev servers and long-running builds. Returns the job/shell identifier and the file the output is streaming to; you will be notified automatically when the command finishes. DO NOT poll for completion. For foreground commands use the shell tool.",
+    input: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "Shell command string to execute" },
+        workdir: {
+          type: "string",
+          description:
+            "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead.",
+        },
+        timeout: {
+          type: "integer",
+          minimum: 0,
+          description:
+            "Timeout in milliseconds. Set to 0 to disable the timeout. Background commands have no timeout by default.",
+        },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+    options: { namespace: "opencode", codemode: true },
+    execute: async (input: AnyObj, context: AnyObj) => {
+      const command = String(input?.command ?? "")
+      try {
+        // Re-invokes the built-in shell executor on the host runtime;
+        // permission prompts and sandbox checks apply unchanged.
+        return await runBuiltin(
+          {
+            command,
+            ...(input?.workdir !== undefined ? { workdir: String(input.workdir) } : {}),
+            ...(input?.timeout !== undefined ? { timeout: Number(input.timeout) } : {}),
+            background: true,
+          },
+          context,
+        )
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { content: `bg_shell failed: ${message}` }
+      }
+    },
+  }
+}
+
 function modelLimitsCacheFile(): string {
   return path.join(process.env.XDG_CACHE_HOME ?? path.join(homedir(), ".cache"), "opencode", "colored-tabs-models-dev.json")
 }
@@ -526,10 +589,36 @@ const plugin = {
       })
     })
 
+    // ---- agent-facing background shell alias: opencode_bg_shell ----
+    // Alias of the built-in `shell` agent tool with `background: true` forced.
+    // The built-in executor is retrieved through the tool editor and reused
+    // verbatim, so every run goes through OpenCode's normal shell policy:
+    // permission prompt, workdir/file-access checks, Job/Shell services,
+    // streamed output file and the automatic completion notification. No
+    // child_process/spawn and no raw shell endpoints are involved; if the
+    // host does not expose the built-in executor, the alias is not
+    // registered (fail closed rather than spawn unsandboxed).
+    const bgShellRegistration = await toolCtx.transform((editor: AnyObj) => {
+      const builtin = editor.get("shell") as BgShellBuiltin | undefined
+      const alias = createBgShellAlias(builtin)
+      if (!alias) {
+        debug(debugOn, "tools:bg_shell skipped", "built-in shell tool/executor not exposed by editor")
+        return
+      }
+      editor.add(alias)
+      debug(debugOn, "tools:bg_shell registered", "alias of built-in shell (background: true)")
+    })
+
     return () => {
       settingsWatcher?.close()
       clearTimeout(serverRefreshTimer)
-      for (const registration of [transformRegistration, hookRegistration, messagingRegistration, modelLimitsRegistration]) {
+      for (const registration of [
+        transformRegistration,
+        hookRegistration,
+        messagingRegistration,
+        bgShellRegistration,
+        modelLimitsRegistration,
+      ]) {
         try {
           registration?.dispose?.()
         } catch {}
