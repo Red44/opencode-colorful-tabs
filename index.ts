@@ -131,6 +131,7 @@ function mergeModelLimits(
 /** Input/execute contract the alias needs from the built-in `shell` tool. */
 export type BgShellBuiltin = {
   execute: (input: AnyObj, context: AnyObj) => Promise<AnyObj>
+  output?: unknown
 }
 
 /**
@@ -143,7 +144,10 @@ export type BgShellBuiltin = {
  * unsandboxed as a fallback).
  */
 export function createBgShellAlias(builtin: BgShellBuiltin | undefined): AnyObj | undefined {
-  if (!builtin || typeof builtin.execute !== "function") return undefined
+  // The shell executor returns a structured `output` value. Code Mode rejects
+  // tools that return that field without declaring its schema, so fail closed
+  // if this host doesn't expose the built-in schema alongside its executor.
+  if (!builtin || typeof builtin.execute !== "function" || builtin.output === undefined) return undefined
   const runBuiltin = builtin.execute
   return {
     name: "bg_shell",
@@ -168,25 +172,22 @@ export function createBgShellAlias(builtin: BgShellBuiltin | undefined): AnyObj 
       required: ["command"],
       additionalProperties: false,
     },
+    output: builtin.output,
     options: { namespace: "opencode", codemode: true },
     execute: async (input: AnyObj, context: AnyObj) => {
       const command = String(input?.command ?? "")
-      try {
-        // Re-invokes the built-in shell executor on the host runtime;
-        // permission prompts and sandbox checks apply unchanged.
-        return await runBuiltin(
-          {
-            command,
-            ...(input?.workdir !== undefined ? { workdir: String(input.workdir) } : {}),
-            ...(input?.timeout !== undefined ? { timeout: Number(input.timeout) } : {}),
-            background: true,
-          },
-          context,
-        )
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        return { content: `bg_shell failed: ${message}` }
-      }
+      // Re-invokes the built-in shell executor on the host runtime;
+      // permission prompts and sandbox checks apply unchanged. Preserve its
+      // typed output so Code Mode can validate the shellID/output/status.
+      return runBuiltin(
+        {
+          command,
+          ...(input?.workdir !== undefined ? { workdir: String(input.workdir) } : {}),
+          ...(input?.timeout !== undefined ? { timeout: Number(input.timeout) } : {}),
+          background: true,
+        },
+        context,
+      )
     },
   }
 }
