@@ -120,6 +120,7 @@ change defaults:
         "promptSync": true,    // prompt dashes + agent name follow active tab
         "mcpSessionInjection": false, // stamp session IDs into MCP tool calls (see below)
         "modelLimitsRefresh": true, // refresh model limits from models.dev at startup
+        "providerRequestTimeoutMs": 300000, // whole-request cap (ms) for ALL providers; false disables
         "debug": false         // log matcher decisions to /tmp/opencode/...
       }
     }
@@ -172,6 +173,26 @@ fall back to the last-known registry snapshot cached under
 list and individual stats absent from partial entries keep their last-known
 catalog/cache values. No credentials are involved.
 
+### Provider request timeout
+
+On by default for **all configured providers** (`providerRequestTimeoutMs:
+false` disables). At startup the server entry registers a provider transform
+that stamps `settings.timeout = 300000` (5 minutes) into every provider in
+the catalog, preserving all other provider settings and leaving model-specific
+settings untouched.
+
+`timeout` is a **whole-request cap**: OpenCode applies it as an
+`AbortSignal.timeout` on the entire provider request, from connection to end
+of the streamed response. It is not the 5-minute `headerTimeout` /
+`chunkTimeout` idle caps (which only guard time-to-headers and SSE idle gaps
+between chunks). The practical consequence: a single provider request that is
+still legitimately streaming at 5 minutes is cancelled at the cap — and
+OpenCode core then retries the transport timeout error automatically, up to
+3 times. A numeric value sets a custom cap in milliseconds; invalid,
+non-finite, or non-positive values safely fall back to the default. The
+transform replays on catalog rebuilds and is idempotent (providers already
+carrying the exact value are not rewritten).
+
 ### Cross-session tools
 
 Always registered (in the `opencode` namespace, Code Mode catalog):
@@ -199,7 +220,8 @@ storage as fallback).
 ## Files
 
 - `tui.ts` — TUI plugin: tab styling, prompt sync, utility data and slots
-- `index.ts` — server-side entry: opt-in MCP session injection
+- `index.ts` — server-side entry: opt-in MCP session injection, model-limit
+  refresh, provider-wide request timeout
 - `bar-scripts.ts` — discovers and evaluates global/project progress scripts
 - `bar-script-worker.ts` — per-invocation worker that loads and validates a script
 - `sidebar.tsx` — compact session overview panel

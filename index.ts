@@ -35,6 +35,8 @@ interface Options {
   mcpSessionInjection?: boolean
   mcpSessionInjectionServers?: string[]
   modelLimitsRefresh?: boolean
+  /** Whole-request cap (ms) stamped into every provider's settings. `false` disables. */
+  providerRequestTimeoutMs?: number | false
   debug?: boolean
 }
 
@@ -245,6 +247,48 @@ export async function loadModelLimits(debugOn: boolean): Promise<Map<string, Mod
   return cached && cached.size > 0 ? cached : null
 }
 
+// ---- provider-wide request timeout ----
+// OpenCode turns a provider's `settings.timeout` into a whole-request
+// AbortSignal timeout at the fetch layer — a hard cap on the entire response,
+// distinct from the 5-minute `headerTimeout`/`chunkTimeout` idle caps. A
+// provider transform stamps the same cap into every configured provider at
+// startup, so no provider request can hang indefinitely. OpenCode core
+// retries the resulting transport timeout up to 3 times.
+
+export const DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS = 300_000
+
+/**
+ * Resolve the `providerRequestTimeoutMs` option: `false` disables the cap, a
+ * finite positive number applies as-is, and any invalid value (wrong type,
+ * non-finite, non-positive) safely falls back to the 5-minute default.
+ */
+export function resolveProviderRequestTimeout(raw: unknown): number | false {
+  if (raw === false) return false
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return raw
+  return DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS
+}
+
+/**
+ * Stamp `timeoutMs` into every listed provider's settings while preserving
+ * all other provider settings (and model-specific settings). Idempotent:
+ * providers already carrying the exact value are not updated. Returns the
+ * number of providers changed.
+ */
+export function applyProviderRequestTimeout(editor: AnyObj, timeoutMs: number): number {
+  let updated = 0
+  for (const record of editor.list() as AnyObj[]) {
+    const info = (record?.provider ?? {}) as AnyObj
+    const providerID = String(info.id ?? "")
+    if (!providerID) continue
+    if ((info.settings as AnyObj | undefined)?.timeout === timeoutMs) continue
+    editor.update(providerID, (provider: AnyObj) => {
+      provider.settings = { ...(provider.settings ?? {}), timeout: timeoutMs }
+    })
+    updated++
+  }
+  return updated
+}
+
 const plugin = {
   id: "red.colored-tabs.server",
   async setup(ctx: AnyObj) {
@@ -271,10 +315,34 @@ const plugin = {
       }
     }
 
+    // Provider-wide request timeout sits at the same server-startup layer as
+    // the model refresh: register before the tool API guard so the cap is
+    // stamped in every host, and dispose it alongside the other transforms.
+    const providerCtx = ctx.provider as AnyObj | undefined
+    let providerTimeoutRegistration: AnyObj | undefined
+    if (providerCtx && typeof providerCtx.transform === "function") {
+      const timeoutMs = resolveProviderRequestTimeout(options.providerRequestTimeoutMs)
+      if (timeoutMs === false) {
+        debug(debugOn, "providers:timeout disabled")
+      } else {
+        providerTimeoutRegistration = await providerCtx.transform((editor: AnyObj) => {
+          const updated = applyProviderRequestTimeout(editor, timeoutMs)
+          if (updated > 0) debug(debugOn, "providers:timeout applied", updated, "providers at", timeoutMs, "ms")
+        })
+        debug(debugOn, "providers:timeout active", timeoutMs, "ms")
+      }
+    }
+
     const toolCtx = ctx.tool as AnyObj | undefined
     if (!toolCtx || typeof toolCtx.transform !== "function" || typeof toolCtx.hook !== "function") {
       debug(debugOn, "mcp:unavailable", "tool transform/hook APIs missing in this OpenCode version")
-      return () => modelLimitsRegistration?.dispose?.()
+      return () => {
+        for (const registration of [modelLimitsRegistration, providerTimeoutRegistration]) {
+          try {
+            registration?.dispose?.()
+          } catch {}
+        }
+      }
     }
 
     // Injection state: the Utilities dialog's persisted setting wins once
@@ -619,6 +687,7 @@ const plugin = {
         messagingRegistration,
         bgShellRegistration,
         modelLimitsRegistration,
+        providerTimeoutRegistration,
       ]) {
         try {
           registration?.dispose?.()
